@@ -40,15 +40,11 @@ final class CanvasLayout {
     private static volatile int skipped = 0;
 
     /**
-     * 两窗自动放大：记录每个画布实例是否已经自动放大过。
+     * 两窗放大统一记账：记录哪些"画布实例"已经做过首次自动放大。
      *
-     * 需求：进入系统画布二分屏时，默认让一个窗口占满（88%），另一个留一条（12%），
-     * 点小窗再由系统原生翻转比例。所以只需要"刚进入两窗"时触发一次放大，之后
-     * 的点小窗翻转、缩小、恢复都是系统原生行为，绝不能再插手。
-     *
-     * 为什么用 WeakHashMap 按 container 记账而不是全局 boolean：画布可能退出重建，
-     * 新 container 需要重新自动放大一次；按实例记录既能防同一会话里 N2()/watchdog
-     * 每秒重排反复触发，又能让新画布重新生效。
+     * 需求：进入系统画布二分屏时，默认让一个窗口占满（88%），另一个留一条（12%）。
+     * 按 container 记账，保证同一画布会话里自动放大只发生一次；画布重建后新
+     * container 会重新放大一次。
      */
     private static final java.util.WeakHashMap<Object, Boolean> twoAutoZoomed =
             new java.util.WeakHashMap<>();
@@ -56,10 +52,16 @@ final class CanvasLayout {
     private static final java.util.WeakHashMap<Object, Boolean> twoZoomPending =
             new java.util.WeakHashMap<>();
     /**
-     * 自己记的上一次窗口数。不能用 taskCounts：N2 的 before 里 syncTaskData 已经
-     * 把它刷成当前值了，after 再读永远是 2，"刚进入两窗"就永远判不出来。
+     * 每个窗口(task)是否已经放大过——自动放大和点击放大共用这一张表。
+     *
+     * 坑（已修 bug）：原来自动放大按 container 记（twoAutoZoomed），点击放大按 task
+     * 记（clickZoomed），两套 key 互不共享。结果：进两窗时自动放大了虎扑，焦点切到
+     * 酷安再回虎扑时，点击放大查 clickZoomed 里虎扑没记录，又放大一次。
+     * 修法：无论自动还是点击，实际放大前都在 doAutoEnlargeTwo 里按目标 task 查这张表，
+     * 放大后立刻记进去；两种入口共享，保证一个窗口一生只放大一次。
+     * key 用 task 对象（u1/d），窗口关闭后自动从弱表回收。
      */
-    private static final java.util.WeakHashMap<Object, Integer> twoLastCount =
+    private static final java.util.WeakHashMap<Object, Boolean> enlargedTasks =
             new java.util.WeakHashMap<>();
 
     /** 布局参数指纹：任务数、应用标识、taskId、bounds，用来跳过没变化的重排。 */
@@ -1033,7 +1035,8 @@ final class CanvasLayout {
                         if (Boolean.TRUE.equals(twoZoomPending.get(container))) return;
                         twoZoomPending.put(container, Boolean.TRUE);
                         log("auto enlarge two: O2 fired, scheduling");
-                        // 等布局和 rectFList 就绪再放大，太早会失败
+                        // 等布局和 rectFList 就绪再放大，太早会报 rectFList is null。
+                        // 原 900ms 体感偏慢，缩到 450ms；再短 O2 可能还没摆完。
                         new android.os.Handler(android.os.Looper.getMainLooper())
                                 .postDelayed(() -> {
                                     try {
@@ -1047,7 +1050,7 @@ final class CanvasLayout {
                                     } finally {
                                         twoZoomPending.remove(container);
                                     }
-                                }, 900);
+                                }, 450);
                     } catch (Throwable error) {
                         log("auto enlarge two O2 failed: " + error);
                     }
@@ -1081,13 +1084,21 @@ final class CanvasLayout {
             if (task == null) task = XposedHelpers.callMethod(adapter, "getItem", 0);
             if (task == null) return;
 
+            // 统一按 task 记账：这个窗口放大过就不再放大，无论触发来源是自动还是点击。
+            // 这样"进两窗自动放大虎扑 → 焦点去酷安 → 回虎扑点击"不会再放大一次。
+            if (Boolean.TRUE.equals(enlargedTasks.get(task))) {
+                log("skip enlarge: task already enlarged");
+                return;
+            }
+            enlargedTasks.put(task, Boolean.TRUE);
+
             android.content.Context ctx = ((android.view.View) container).getContext();
             ClassLoader loader = container.getClass().getClassLoader();
             Class<?> replacer = XposedHelpers.findClass(
                     "com.oplus.pscanvas.canvasmode.canvas.c", loader);
             Object instance = XposedHelpers.newInstance(replacer, ctx);
             XposedHelpers.callMethod(instance, "m", container, task, true);
-            log("auto enlarged two-window focus");
+            log("enlarged two-window task (focus=" + focus + ")");
         } catch (Throwable error) {
             log("do auto enlarge two failed: " + error);
         }
@@ -1264,11 +1275,14 @@ final class CanvasLayout {
                                 // 清空/换成三窗矩形，导致 autoScale 报 "rectFList is null"、
                                 // 点小窗无法翻转。
                                 if (total == 2) {
-                                    // 需求：点窗口就放大该窗口（含 50:50 时点酷安也放大）。
-                                    // T() 会先把焦点切到被点窗口，而系统 m() 放大的正是
-                                    // 焦点窗口（m 内部取 controller.n()）。所以延迟一点等
-                                    // 焦点切完，再调 doAutoEnlargeTwo 放大当前焦点即被点窗口。
-                                    // 88:12 点小窗系统原生也会翻转，目标一致，重复调用幂等。
+                                    // 需求：点窗口就放大该窗口（含 50:50 时也放大），
+                                    // 且每个窗口只在第一次放大——自动和点击共用 enlargedTasks，
+                                    // 记账统一在 doAutoEnlargeTwo 内部按实际放大的 task 做，
+                                    // 这里不再单独记账，避免"自动放大虎扑没记 task → 点击又放大"。
+                                    // T() 会把焦点切到被点窗口，很短延迟等焦点切完即可。
+                                    Object clickedTask = XposedHelpers.callMethod(
+                                            adapter, "getItem", index);
+                                    if (clickedTask == null) return;
                                     final Object clicked = param.thisObject;
                                     new android.os.Handler(android.os.Looper.getMainLooper())
                                             .postDelayed(() -> {
@@ -1278,7 +1292,7 @@ final class CanvasLayout {
                                                 } catch (Throwable error) {
                                                     log("click-to-enlarge failed: " + error);
                                                 }
-                                            }, 250);
+                                            }, 120);
                                     return;
                                 }
                                 if (total < 3) return;
