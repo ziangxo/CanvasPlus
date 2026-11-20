@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 静态快捷方式标签：shortLabel 显示在长按菜单里（要短），longLabel 给无障碍/系统用 -->
+    <string name="sc_three_short">三分屏</string>
+    <string name="sc_three_long">开三分屏画布</string>
+    <string name="sc_config_short">面板配置</string>
+    <string name="sc_config_long">CanvasPlus 面板配置（隐藏/排序/焦点）</string>
+    <string name="sc_copy_three_short">复制三分屏命令</string>
+    <string name="sc_copy_three_long">把调起三分屏的 shell 命令复制到剪贴板</string>
+    <string name="sc_copy_add_short">复制加应用命令</string>
+    <string name="sc_copy_add_long">把往画布加应用的 shell 命令复制到剪贴板</string>
+</resources>

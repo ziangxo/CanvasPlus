@@ -6,11 +6,14 @@
 
 **可用**：两个、三个、四个应用同时进画布。
 
-- 三窗：一左两右（竖屏），点小窗换主窗
-- 四窗：2×2 四等分，点窗口放大，菜单可切换放大/缩小
+- 三窗：默认进入总览（一左两右整体缩小居中），点窗口放大该窗口，菜单可切换放大/缩小
+- 四窗：2×2 四等分总览，点窗口放大，菜单可切换放大/缩小
 - 窗口菜单：全屏、浮窗、放大/缩小、替换应用、关闭
+- 二窗：保持本项目自己的增强——进二分屏自动放大焦点窗、点窗口放大（上游 v0.2.0 把二窗交回系统原生）
+- 画布固定竖屏，不跟随手机旋转
+- 三窗/四窗弹输入法时画布整体抬高到焦点窗口露出键盘，按键不会丢
 - 拖拽条：只支持点击交换，拖动已禁用
-- 入口：桌面快捷方式直接开四窗，智能侧边栏加到当前画布
+- 入口：桌面快捷方式直接开四窗，智能侧边栏加到当前画布（侧边栏点应用时当场问画布能不能接，接不了才开小窗）
 
 **限制**：主窗无法既占满宽度又保持应用比例、同时不留白。这是画布按「等比缩放」渲染的固有限制，详见 [docs/coloros-multiwindow.md](docs/coloros-multiwindow.md)。
 
@@ -81,6 +84,29 @@ adb shell am broadcast -a com.canvasplus.START \
 | 6 | 大窗在左 |
 | 7 | 大窗在右 |
 
+## 快捷方式与第三方调用
+
+长按桌面图标有四条静态快捷方式（`res/xml/shortcuts.xml`）：
+「三分屏」「面板配置」「复制三分屏命令」「复制加应用命令」。
+后两条不打开界面，直接把对应 shell 命令写进剪贴板并 toast 出来。
+「面板配置」页顶部另有「可调用的 shell 命令」清单（等宽字体、可选中、每行带「复制」按钮），
+包含带参数的变体（指定布局方向 3~7、切换三窗方向）。
+
+第三方 App 要调起三分屏，用显式的这个组件（透明、无 UI，执行完立即 finish）：
+
+```bash
+adb shell am start -n com.canvasplus/.ShortcutActivity -a com.canvasplus.SC_THREE --ei mode 4
+adb shell am broadcast -a com.canvasplus.START        # 等价，直接打到系统框架里的 Trigger
+```
+
+`ShortcutActivity` 只负责把动作转成广播，真正起画布的是 system_server 里的 `Trigger`
+（它持有 `com.oplus.permission.safe.WINDOW` 之类的系统权限，普通 App 直接 startActivity
+调 `ContainerActivity` 会被 `SecurityException` 拒）。
+
+注意：普通 App **拿不到**别家的快捷方式——`LauncherApps.getShortcuts()` /
+`startShortcut()` 需要 `ACCESS_SHORTCUTS`（signature 级）或桌面角色。静态快捷方式主要给
+系统桌面长按菜单用，跨应用调用走上面的显式组件。
+
 如果画布进程没在运行，广播收不到。先拉起：
 
 ```bash
@@ -122,8 +148,18 @@ adb shell su -c 'touch /data/system/canvasplus-halt'
 | `ModuleEntry` | 入口，按进程分发，停止阀 |
 | `CanvasLayout` | 画布布局、四窗、菜单、交换、关闭、浮窗 |
 | `FeatureUnlock` | feature 开关、窗口数上限、Launcher 入口 |
-| `Trigger` | 广播入口，往画布加窗口 |
-| `SidebarEntry` | 智能侧边栏，把应用加到当前画布 |
+| `Trigger` | 广播入口，往画布加窗口；也代写替换面板配置 |
+| `SidebarEntry` | 智能侧边栏，点应用时问画布能不能接，接不了才开小窗 |
+| `AutoReplace` | 三分屏后自动弹替换面板；面板「全部应用」的隐藏/排序 |
+| `ConfigActivity` | 替换面板配置页（勾选隐藏、↑↓ 排序），桌面有图标入口 |
+
+替换面板配置存在 `Settings.Global` 的 `canvasplus_autoreplace`（`{"hidden":[],"order":[]}`），
+三分屏焦点存在 `canvasplus_triple_focus`（`-1` 不干预 / `0` 左窗 / `1` 上窗 / `2` 右下窗），
+三窗/四窗「从菜单缩小后点窗口只切焦点、不放大」开关存在 `canvasplus_no_click_zoom`
+（`1` 开 / `0` 关，缺省为开），三项都在桌面「CanvasPlus 面板配置」里改。写它们需要一次
+`adb shell pm grant com.canvasplus android.permission.WRITE_SECURE_SETTINGS`；
+没授权时配置页会改走广播让 system_server 代写。改完配置重新打开一次面板、
+或重新触发一次三分屏即生效（不需要重启框架）。
 
 ## 许可
 

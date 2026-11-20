@@ -1,13 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.canvasplus"
-    android:versionCode="2"
-    android:versionName="1.2.0">
+    android:versionCode="6"
+    android:versionName="1.6.0">
 
     <uses-sdk android:minSdkVersion="35" android:targetSdkVersion="36" />
 
+    <!--
+      替换面板的隐藏/排序配置要写 Settings.Global，pscanvas 才能读到（不同 UID 读不到 App 私有 SP）。
+      这个权限是 signature|privileged 级别，普通安装拿不到，必须 adb 手动授予：
+        adb shell pm grant com.canvasplus android.permission.WRITE_SECURE_SETTINGS
+      没授权时 ConfigActivity 自动降级成发广播给 system_server 里的 Trigger 代写，
+      所以即使忘了 grant 也不会丢配置（前提是 android 在 LSPosed 作用域里）。
+    -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
+    <!--
+      枚举「全部应用」列表要用 queryIntentActivities(MAIN+LAUNCHER)。
+      targetSdk 30+ 有包可见性过滤，不声明 queries 时 queryIntentActivities 只返回自己，
+      配置页会变成空白列表（踩过）。这里按 intent 声明即可，不需要 QUERY_ALL_PACKAGES。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:hasCode="true"
+        android:icon="@mipmap/ic_launcher"
         android:label="CanvasPlus">
 
         <meta-data android:name="xposedmodule" android:value="true" />
@@ -16,5 +38,44 @@
         <meta-data android:name="xposedminversion" android:value="82" />
         <meta-data android:name="xposedscope"
             android:value="com.oplus.pscanvas;com.coloros.smartsidebar" />
+
+        <!--
+          替换面板「隐藏 / 排序」配置页。
+          之前模块没有任何 Activity，配置只能靠发广播手写 JSON，这里补一个可点开的入口：
+          exported=true 是为了能 adb 直接拉起调试
+            adb shell am start -n com.canvasplus/.ConfigActivity
+          LAUNCHER intent-filter 让它出现在桌面应用列表里，用户不用记命令。
+        -->
+        <activity
+            android:name="com.canvasplus.ConfigActivity"
+            android:exported="true"
+            android:label="CanvasPlus 面板配置"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- 静态快捷方式（长按图标出现的那几项），文件见 res/xml/shortcuts.xml -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+        </activity>
+
+        <!--
+          快捷方式 / 第三方调用的统一入口（2026-11-21）。
+          透明、无 UI、onCreate 里就把动作转成广播后 finish：
+            adb shell am start -n com.canvasplus/.ShortcutActivity -a com.canvasplus.SC_THREE
+          也可以用 am start 的整数参数 mode 指定三分屏布局方向（3~7，默认 4）。
+          必须有主题且不能是 NoDisplay，否则某些 ROM 在"由快捷方式启动"的路径上
+          会因为窗口不可见而直接判失败；Translucent.NoTitleBar 最稳。
+        -->
+        <activity
+            android:name="com.canvasplus.ShortcutActivity"
+            android:exported="true"
+            android:label="CanvasPlus"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
     </application>
 </manifest>

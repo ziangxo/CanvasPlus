@@ -1,69 +1,67 @@
 package com.canvasplus;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
 /**
- * 智能侧边栏：画布在前台时，点应用不再开小窗，而是加进画布。
+ * 智能侧边栏：画布在前台时，点应用加进画布，否则照旧开小窗。
  *
- * 侧边栏点应用走 PageRoutUtils.startActivityAsZoomWindow(Intent, ...)，
- * 默认开 ZoomWindow。这里先判断画布是否在前台，是就从最近任务里找该应用的
- * taskId，调 FlexibleWindowManager.startFlexibleWindowForRecentTasks 加进画布，
- * 然后拦掉原来的小窗启动。
+ * 侧边栏点应用走 PageRoutUtils.startActivityAsZoomWindow(Intent, ...)。这里拦下来，
+ * 发一条有序广播问画布进程"能不能接一个新窗口"。画布自己看 Activity 是否可见、
+ * 窗口数是否到 4，用 resultCode 回答：
+ *
+ *   1 → 画布接了，随后异步加窗口
+ *   0 → 画布不在前台、已经满了、或者进程没在，回退到原来的小窗
+ *
+ * 判断交给画布自己做，侧边栏不用跨进程保存任何状态。
+ *
+ * 为什么不再用心跳（v0.1.0 的做法）：心跳是"画布每秒广播一次我可见/我有几个窗口"，
+ * 侧边栏只记 2.5 秒内收到的最新值。这套在本机有两个坑：
+ *   1) 判断分散在两个进程，侧边栏拿到的是几秒前的旧状态，点得快就误判；
+ *   2) 画布的 isVisible()/isShown() 在侧边栏盖上来时读数不稳定，曾长期读成 false，
+ *      表现为"加第三个应用永远失败"，只能靠 watchdog 每秒刷一次来掩盖。
+ * 现在侧边栏问、画布当场答（看 Activity 的 mResumed/mStopped + 窗口数），
+ * 不依赖任何跨进程缓存，也不会被心跳时间窗卡住。
+ * 同时画布侧那条 CANVAS_STATE 每秒广播可以整个删掉，省掉每秒两条跨进程广播。
  */
 final class SidebarEntry {
 
     private static final String TAG = "CanvasPlus";
     private static final String ROUTE =
             "com.oplus.smartsidebar.panelview.edgepanel.utils.PageRoutUtils";
-    private static final String MANAGER =
-            "com.oplus.flexiblewindow.FlexibleWindowManager";
+    private static final String CANVAS = "com.oplus.pscanvas";
+    private static final String ACTION_ADD = "com.canvasplus.ADD";
+
+    /** 兜底重放开小窗时，别让 hook 再拦一次。 */
+    private static final ThreadLocal<Boolean> replaying = new ThreadLocal<>();
 
     private SidebarEntry() {}
 
-    /** 画布当前是否在前台（由画布进程广播维护）。 */
-    private static volatile boolean canvasVisible = false;
-    /** 画布窗口数，画布进程通过 CANVAS_STATE 广播同步过来。 */
-    private static volatile int canvasCount = -1;
-    /** 最近一次收到"画布可见"心跳的时间。 */
-    private static volatile long lastVisibleTime = 0L;
-
-    static void install(ClassLoader loader) {
-        armReceiver(loader, 0);
+    static void install(final ClassLoader loader) {
         try {
             Class<?> route = XposedHelpers.findClass(ROUTE, loader);
             XposedBridge.hookAllMethods(route, "startActivityAsZoomWindow",
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            if (Boolean.TRUE.equals(replaying.get())) return;
                             if (!(param.args[0] instanceof Intent)) return;
-                            Intent intent = (Intent) param.args[0];
-                            String pkg = intent.getPackage();
-                            if (pkg == null) {
-                                pkg = intent.getComponent() == null
-                                        ? null : intent.getComponent().getPackageName();
-                            }
+                            String pkg = packageOf((Intent) param.args[0]);
                             if (pkg == null) return;
-                            if (!shouldAddToCanvas(loader)) return;
 
-                            try {
-                                Object app = XposedHelpers.callStaticMethod(
-                                        XposedHelpers.findClass(
-                                                "android.app.ActivityThread", loader),
-                                        "currentApplication");
-                                if (app instanceof android.content.Context) {
-                                    Intent add = new Intent("com.canvasplus.ADD");
-                                    add.setPackage("com.oplus.pscanvas");
-                                    add.putExtra("pkg", pkg);
-                                    ((android.content.Context) app).sendBroadcast(add);
-                                    param.setResult(null);
-                                    log("sidebar broadcast add " + pkg);
-                                }
-                            } catch (Throwable error) {
-                                log("broadcast add failed: " + error);
+                            param.setResult(null);
+                            Context ctx = application(loader);
+                            if (ctx == null) {
+                                replay(param);
+                                return;
                             }
+                            ask(ctx, pkg, param);
                         }
                     });
             log("sidebar hooked");
@@ -72,98 +70,65 @@ final class SidebarEntry {
         }
     }
 
-    /** 侧边栏进程刚起来时拿不到 Context，尽快尝试并在失败时退避重试。 */
-    private static void armReceiver(final ClassLoader loader, final int attempt) {
-        long delay = attempt == 0 ? 100L : 300L;
-        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-            if (registerStateReceiver(loader)) return;
-            if (attempt < 20) armReceiver(loader, attempt + 1);
-        }, delay);
+    /** 问画布能不能加，回执不是 1 就还回去开小窗。 */
+    private static void ask(Context ctx, final String pkg,
+                            final XC_MethodHook.MethodHookParam param) {
+        Intent add = new Intent(ACTION_ADD);
+        add.setPackage(CANVAS);
+        add.putExtra("pkg", pkg);
+        add.putExtra("ordered", true);
+        try {
+            ctx.sendOrderedBroadcast(add, null, new BroadcastReceiver() {
+                @Override public void onReceive(Context c, Intent result) {
+                    if (getResultCode() == 1) {
+                        log("sidebar add " + pkg + " -> canvas");
+                        return;
+                    }
+                    log("sidebar add " + pkg + " -> zoom fallback");
+                    new Handler(Looper.getMainLooper()).post(() -> replay(param));
+                }
+            }, null, 0, null, null);
+        } catch (Throwable error) {
+            log("sidebar ask failed: " + error);
+            replay(param);
+        }
     }
 
-    private static volatile boolean stateReceiverReady = false;
-
-    private static boolean registerStateReceiver(ClassLoader loader) {
-        if (stateReceiverReady) return true;
+    /**
+     * 画布没接，按原参数再调一次，让系统开小窗。
+     *
+     * 坑（上游 v0.2.0 记录并已避开）：参数里有 null，
+     * XposedHelpers.callMethod(method, thisObject, args) 会按参数**类型**去查方法，
+     * 遇到 null 直接抛异常，小窗就开不出来了。这里用原生反射 invoke。
+     */
+    private static void replay(XC_MethodHook.MethodHookParam param) {
+        replaying.set(Boolean.TRUE);
         try {
-            Object ctx = XposedHelpers.callStaticMethod(
+            ((java.lang.reflect.Method) param.method).invoke(param.thisObject, param.args);
+        } catch (Throwable error) {
+            log("zoom fallback failed: " + error);
+        } finally {
+            replaying.remove();
+        }
+    }
+
+    private static String packageOf(Intent intent) {
+        String pkg = intent.getPackage();
+        if (pkg != null) return pkg;
+        return intent.getComponent() == null
+                ? null : intent.getComponent().getPackageName();
+    }
+
+    private static Context application(ClassLoader loader) {
+        try {
+            Object app = XposedHelpers.callStaticMethod(
                     XposedHelpers.findClass("android.app.ActivityThread", loader),
                     "currentApplication");
-            if (!(ctx instanceof android.content.Context)) {
-                return false;
-            }
-            android.content.Context app = (android.content.Context) ctx;
-            app.registerReceiver(new android.content.BroadcastReceiver() {
-                @Override public void onReceive(android.content.Context c, Intent intent) {
-                    // 只认"可见"的心跳。侧边栏盖上来时画布会 pause，但 window
-                    // 还在，画布会继续报 true；切到别的应用就只剩 false 了。
-                    if (!intent.getBooleanExtra("visible", false)) return;
-                    canvasVisible = true;
-                    canvasCount = intent.getIntExtra("count", -1);
-                    lastVisibleTime = android.os.SystemClock.elapsedRealtime();
-                    log("canvas visible, count=" + canvasCount);
-                }
-            }, new android.content.IntentFilter("com.canvasplus.CANVAS_STATE"),
-                    android.content.Context.RECEIVER_EXPORTED);
-            stateReceiverReady = true;
-            log("state receiver registered");
-            return true;
+            return app instanceof Context ? (Context) app : null;
         } catch (Throwable error) {
-            log("state receiver failed: " + error);
-            return false;
+            log("no application: " + error);
+            return null;
         }
-    }
-
-    /**
-     * 侧边栏点应用只有两种结果：加进画布，或者照旧开小窗。
-     * 判断就两条：
-     *   1. 栈顶是不是画布（当前确实在分屏界面里）
-     *   2. 画布的窗口数还没到 4
-     * 其它情况一律不拦，让系统开小窗。
-     */
-    /**
-     * 侧边栏点应用只有两种结果：加进画布，或者照旧开小窗。
-     * 只看画布有没有发"可见"心跳，2.5 秒没收到就当作当前没有前台画布。
-     */
-    private static boolean shouldAddToCanvas(ClassLoader loader) {
-        long age = android.os.SystemClock.elapsedRealtime() - lastVisibleTime;
-        if (lastVisibleTime == 0L || age > 2500L) {
-            log("sidebar: no visible canvas (age=" + age + "), keep zoom");
-            return false;
-        }
-        if (canvasCount >= 4) {
-            log("sidebar: canvas full " + canvasCount + ", keep zoom");
-            return false;
-        }
-        return true;
-    }
-
-    /** 在最近任务里找这个包的任务。 */
-    private static int findTaskId(ClassLoader loader, String pkg) {
-        try {
-            Object atms = XposedHelpers.callStaticMethod(
-                    XposedHelpers.findClass("android.app.ActivityTaskManager", loader),
-                    "getService");
-            Object tasks = null;
-            for (Object[] args : new Object[][]{
-                    {100, false, false}, {100, false}, {100}}) {
-                try {
-                    tasks = XposedHelpers.callMethod(atms, "getTasks", args);
-                    if (tasks instanceof java.util.List) break;
-                } catch (Throwable ignored) {
-                }
-            }
-            if (!(tasks instanceof java.util.List)) return -1;
-            for (Object info : (java.util.List<?>) tasks) {
-                Object base = XposedHelpers.getObjectField(info, "baseIntent");
-                if (!(base instanceof Intent)) continue;
-                if (!pkg.equals(((Intent) base).getPackage())) continue;
-                Object id = XposedHelpers.getObjectField(info, "taskId");
-                if (id instanceof Integer) return (Integer) id;
-            }
-        } catch (Throwable ignored) {
-        }
-        return -1;
     }
 
     private static void log(String message) {

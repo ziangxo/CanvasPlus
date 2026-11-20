@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  静态快捷方式：长按桌面图标出现（系统 ShortcutManager 解析，无需运行时注册）。
+
+  限制与注意：
+  1) 必须挂在带 MAIN/LAUNCHER 的 Activity 上（这里是 ConfigActivity），
+     通过它下面的 <meta-data android:name="android.app.shortcuts"> 引用本文件；
+  2) <intent> 的 targetPackage 必须是本包，targetClass 必须是本包组件，
+     所以动作统一落到 ShortcutActivity 这个透明入口；
+  3) 标签必须是 string 资源（不能写字面量），见 res/values/strings.xml；
+  4) 一个 Activity 最多 5 条静态快捷方式，这里刚好 4 条。
+
+  为什么「复制命令」也做成快捷方式：用户要求"在菜单里声明可调用的 shell 命令，
+  并可以复制"。快捷方式本身没法直接往剪贴板写，所以点一下 → ShortcutActivity
+  把命令文本写进剪贴板并 toast 出来（不打开任何界面）。
+  完整命令清单（含带参数的变体）在「面板配置」页里也列了一份，带复制按钮。
+
+  为什么没有「四窗」快捷方式：四窗要在 Trigger 里多塞一个包（fixedPackages 现在
+  是前台应用 + 翻译 + 计算器三个），改 Trigger 属于 system_server 侧代码，
+  装 APK 不热替换、必须重启框架才生效，所以先不加。
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="three"
+        android:shortcutLongLabel="@string/sc_three_long"
+        android:shortcutShortLabel="@string/sc_three_short">
+        <intent
+            android:action="com.canvasplus.SC_THREE"
+            android:targetClass="com.canvasplus.ShortcutActivity"
+            android:targetPackage="com.canvasplus" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="config"
+        android:shortcutLongLabel="@string/sc_config_long"
+        android:shortcutShortLabel="@string/sc_config_short">
+        <intent
+            android:action="android.intent.action.MAIN"
+            android:targetClass="com.canvasplus.ConfigActivity"
+            android:targetPackage="com.canvasplus" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="copy_three"
+        android:shortcutLongLabel="@string/sc_copy_three_long"
+        android:shortcutShortLabel="@string/sc_copy_three_short">
+        <intent
+            android:action="com.canvasplus.SC_COPY_THREE"
+            android:targetClass="com.canvasplus.ShortcutActivity"
+            android:targetPackage="com.canvasplus" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="copy_add"
+        android:shortcutLongLabel="@string/sc_copy_add_long"
+        android:shortcutShortLabel="@string/sc_copy_add_short">
+        <intent
+            android:action="com.canvasplus.SC_COPY_ADD"
+            android:targetClass="com.canvasplus.ShortcutActivity"
+            android:targetPackage="com.canvasplus" />
+    </shortcut>
+
+</shortcuts>

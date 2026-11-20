@@ -18,8 +18,18 @@ if (Test-Path build) { Remove-Item -Recurse -Force build }
 if (Test-Path dist) { Remove-Item -Recurse -Force dist }
 New-Item -ItemType Directory -Force -Path build\classes, build\dex, dist | Out-Null
 
+Write-Host '== aapt2 compile =='
+# 应用图标是 mipmap PNG + 自适应图标 XML + values/colors.xml，
+# 先编译成一个 .flat 包，再交给 link；没有 res 目录时跳过（保持能只带 assets 构建）。
+if (Test-Path app\src\main\res) {
+    & $aapt2 compile --dir app\src\main\res -o build\res.zip
+    if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed $LASTEXITCODE" }
+}
+
 Write-Host '== aapt2 link =='
-& $aapt2 link -o build\base.apk -I $platform --manifest app\src\main\AndroidManifest.xml -A app\src\main\assets --min-sdk-version 35 --target-sdk-version 36
+$resArg = @()
+if (Test-Path build\res.zip) { $resArg += 'build\res.zip' }
+& $aapt2 link -o build\base.apk -I $platform --manifest app\src\main\AndroidManifest.xml -A app\src\main\assets --min-sdk-version 35 --target-sdk-version 36 @resArg
 if ($LASTEXITCODE -ne 0) { throw "aapt2 failed $LASTEXITCODE" }
 
 Write-Host '== javac =='

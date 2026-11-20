@@ -25,24 +25,30 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam param) {
         if (param == null || param.packageName == null) return;
+        // 安全阀统一在入口判断（对齐上游 v0.2.0）：以前只拦了 android 分支，
+        // 画布侧和侧边栏侧照样加载。
+        if (halted()) return;
 
         switch (param.packageName) {
             // 下面两个进程默认不在作用域里，留着是为了以后需要时手动勾选
             case "android":
-                if (halted()) return;
                 FeatureUnlock.installSystem(param.classLoader);
                 Trigger.arm(param.classLoader);
                 break;
 
             case "com.oplus.pscanvas":
                 // 画布容器进程，布局问题的真正位置。
-                // 2026-11-20：移除 AutoReplace —— 不再用布局后 hook T() 模拟点击切焦点。
-                // 坑：实测 packages 顺序不决定大窗槽位（计算器放第 1 位大窗是翻译，放第 2 位
-                // 大窗又变成别的包），所以「计算器放第一个=大窗」是错误假设，已删除，禁止据此臆测。
-                // 大窗/焦点由系统逻辑决定，如何让指定应用直接成为大窗仍需基于可工作的放大
-                // 窗口模式（CanvasLayout.hookFourZoom）逆向验证，不能靠改 packages 排序碰运气。
+                // 2026-11-20：AutoReplace **不许改动焦点**（用户反复强调的红线）。
+                // 不调 T()、不模拟点击，焦点完全交给画布初始布局。
+                // 它只做一件事：三窗落地后，给当前焦点窗口自动弹一次替换面板
+                // （container.q0(index).h.x1()），不碰二分屏。
                 CanvasLayout.install(param.classLoader);
-                Trigger.arm(param.classLoader);
+                AutoReplace.install(param.classLoader);
+                // 只收发 ADD，不处理 START：START 由 system_server 处理。
+                // 坑（2026-11-20 LSPosed 日志实测）：两个进程都处理 START 时，一条广播
+                // 会拉起两轮画布（同一秒 system 和 pscanvas 各打一条
+                // "canvas requested, intents=3"），recents 里累积了 9 个 canvas task。
+                Trigger.arm(param.classLoader, false);
                 break;
 
             case "com.coloros.smartsidebar":

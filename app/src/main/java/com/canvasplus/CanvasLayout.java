@@ -25,6 +25,8 @@ final class CanvasLayout {
     private static final String TABLET_POLICY = "B1.r";
     private static final String CONTAINER_VIEW =
             "com.oplus.pscanvas.canvasmode.canvas.view.ContainerView";
+    private static final String CONTAINER_ACTIVITY =
+            "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity";
     private static final String FLEXIBLE_TASK_VIEW =
             "com.oplus.flexiblewindow.FlexibleTaskView";
     static volatile int forcedMode = 0;
@@ -113,6 +115,7 @@ final class CanvasLayout {
         hookAutoEnlargeTwo(loader);
         hookTaskInfo(loader);
         hookResume(loader);
+        lockPortrait(loader);
         hookClick(loader);
         hookDragLock(loader);
         hookOrientation(loader);
@@ -126,40 +129,78 @@ final class CanvasLayout {
         hookExchange(loader);
         hookWindowMenu(loader);
         hookFourZoom(loader);
+        hookTouchRegion(loader);
     }
 
     /**
-     * 三窗时窗口菜单里的"放大窗口/缩小窗口"用不了，直接不给这两项。
-     * 菜单在 t.e0() 末尾统一 add 进 t.W，这里加完再把它们摘掉。
+     * 键盘抬起画布后窗口顶边会跑到屏幕上方。framework 里 FlexibleTaskView 的
+     * 内边距监听要先确认整个窗口都落在屏幕内，只要有一部分出界就整段跳过，
+     * 不给画布窗口挖洞，画布于是吃掉全屏触摸，子窗口点不到。
+     * 这里在它跳过后补一次，出界的部分由 Region 的差集运算自己裁掉。
+     *
+     * 只在 imeActive（输入法正把画布抬高）时补：无条件补会把放大态下其他小窗口的
+     * 触摸也挖给应用，点击直接点进应用，丢掉"先切换放大"这一步（踩过）。
+     */
+    private static void hookTouchRegion(ClassLoader loader) {
+        try {
+            Class<?> listener = XposedHelpers.findClass(
+                    "com.oplus.flexiblewindow.FlexibleTaskView$FlexibleOnComputeInternalInsetsListener",
+                    loader);
+            XposedBridge.hookAllMethods(listener, "onComputeInternalInsets",
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!imeActive) return;
+                                Object view = XposedHelpers.getObjectField(
+                                        param.thisObject, "this$0");
+                                if (view == null) return;
+                                if (XposedHelpers.getBooleanField(view, "mInterceptInputEvent")) {
+                                    return;
+                                }
+                                Rect rect = new Rect();
+                                XposedHelpers.callMethod(view, "getBoundsOnScreen", rect);
+                                if (rect.isEmpty()) return;
+                                Object info = param.args[0];
+                                XposedHelpers.callMethod(info, "setTouchableInsets", 3);
+                                android.graphics.Region region = (android.graphics.Region)
+                                        XposedHelpers.getObjectField(info, "touchableRegion");
+                                region.op(rect, android.graphics.Region.Op.DIFFERENCE);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            log("touch region hooked");
+        } catch (Throwable error) {
+            log("touch region hook failed: " + error);
+        }
+    }
+
+    /**
+     * 三窗和四窗都保留窗口菜单里的"放大窗口/缩小窗口"。
+     * 四窗的放大走 2×2 网格，三窗的放大走官方 a0 焦点缩放。
+     *
+     * 变更记录（对齐上游 v0.2.0）：v0.1.0 这里是反过来的——三窗时把这两项从
+     * t.W 里 removeIf 掉，因为当时三窗没有实现"点放大"的状态同步，点了会错位。
+     * v0.2.0 把 hookFourZoom 扩到 count>=3 并在 T() 里同步三窗状态后，
+     * 三窗可以正常用菜单放大/缩小，于是把这段摘除逻辑整段删掉。
+     * 保留 hook 只为在日志里确认菜单确实建出来了（排查顺序：菜单没建 → 摘除逻辑
+     * 残留 → 状态没同步）。
      */
     private static void hookWindowMenu(ClassLoader loader) {
         try {
             Class<?> menu = XposedHelpers.findClass(
                     "com.oplus.pscanvas.canvasmode.canvas.t", loader);
-            Class<?> strings = XposedHelpers.findClass("t1.j", loader);
-            final int enlargeId = XposedHelpers.getStaticIntField(strings, "W");
-            final int narrowId = XposedHelpers.getStaticIntField(strings, "X");
             XposedBridge.hookAllMethods(menu, "e0", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
                         Object self = param.thisObject;
                         Object container = XposedHelpers.getObjectField(self, "n");
                         Object adapter = fieldOfType(container, "u1.c");
-                        if (adapter == null || count(adapter) != 3) return;
                         Object items = XposedHelpers.getObjectField(self, "W");
-                        if (!(items instanceof java.util.List)) return;
-                        android.content.Context context =
-                                (android.content.Context) XposedHelpers.getObjectField(self, "j");
-                        String enlarge = context.getResources().getString(enlargeId);
-                        String narrow = context.getResources().getString(narrowId);
-                        ((java.util.List<?>) items).removeIf(item -> {
-                            try {
-                                Object title = XposedHelpers.callMethod(item, "t");
-                                return enlarge.equals(title) || narrow.equals(title);
-                            } catch (Throwable ignored) {
-                                return false;
-                            }
-                        });
+                        int total = adapter == null ? -1 : count(adapter);
+                        int size = items instanceof java.util.List
+                                ? ((java.util.List<?>) items).size() : -1;
+                        log("window menu built count=" + total + " items=" + size);
                     } catch (Throwable ignored) {
                     }
                 }
@@ -178,11 +219,45 @@ final class CanvasLayout {
         return Boolean.TRUE.equals(fourZoomed.get(container));
     }
 
+    /** 用户从这个菜单缩小过。只有这种状态下点击窗口才不放大。 */
+    private static final java.util.WeakHashMap<Object, Boolean> menuShrunk =
+            new java.util.WeakHashMap<>();
+
     /**
-     * 四窗的"放大窗口/缩小窗口"。
+     * 设置项：缩小后点击窗口不放大。
      *
-     * 默认四等分（画布按 2×2 总尺寸缩放到屏幕），点放大把焦点窗口铺满屏幕，
-     * 点缩小回到四等分。都走画布自己的 A2() 缩放，不改窗口矩形。
+     * 为什么不用上游的 XSharedPreferences + 模块自带设置页：本项目所有配置
+     * （替换面板隐藏/排序、三分屏焦点）都走 Settings.Global，
+     * 因为 pscanvas 与 App 不同 UID，读不到 App 私有 SP；再引入一套 LSPosed
+     * world-readable SP 会出现两个配置入口、两份真值。这里沿用 Settings.Global。
+     * 读不到（没配置过 / 没权限）按"开"处理，即默认保持缩小态，和上游默认一致。
+     */
+    private static boolean noClickZoom() {
+        try {
+            android.content.Context ctx = (android.content.Context)
+                    XposedHelpers.callStaticMethod(
+                            XposedHelpers.findClass("android.app.ActivityThread", null),
+                            "currentApplication");
+            if (ctx == null) return true;
+            String raw = android.provider.Settings.Global.getString(
+                    ctx.getContentResolver(), "canvasplus_no_click_zoom");
+            if (raw == null || raw.isEmpty()) return true;
+            return !"0".equals(raw.trim());
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    /**
+     * 三窗/四窗的"放大窗口/缩小窗口"。
+     *
+     * 默认总览（四窗按 2×2、三窗按三窗矩形整体缩放），点放大把焦点窗口铺满屏幕，
+     * 点缩小回到总览。都走画布自己的 A2() 缩放，不改窗口矩形。
+     *
+     * 对齐上游 v0.2.0：原来只认 count==4，三窗时这两个菜单项是直接删掉的。
+     * 现在三窗也走这里（total>=3），缩小时三窗用 fitThree 而不是 fitFour。
+     * 另外 p0(zoom) 改成对**所有** task 逐个设置：只给焦点那个设的话，
+     * 菜单状态（放大/缩小）和实际布局会各说各话，要点两次才能缩回去。
      */
     private static void hookFourZoom(ClassLoader loader) {
         try {
@@ -193,21 +268,44 @@ final class CanvasLayout {
                     try {
                         Object container = param.args[0];
                         Object adapter = fieldOfType(container, "u1.c");
-                        if (adapter == null || count(adapter) != 4) return;
+                        if (adapter == null) return;
+                        int total = count(adapter);
+                        if (total < 3) return;
                         boolean enlarge = (Boolean) param.args[2];
                         if (enlarge) {
+                            menuShrunk.remove(container);
                             fourZoomed.put(container, Boolean.TRUE);
-                            XposedHelpers.callMethod(param.args[1], "p0", true);
+                            int focus = 0;
+                            Object position = XposedHelpers.callMethod(
+                                    adapter, "getPosition", param.args[1]);
+                            if (position instanceof Integer && (Integer) position >= 0) {
+                                focus = (Integer) position;
+                            }
+                            for (int i = 0; i < total; i++) {
+                                Object task = XposedHelpers.callMethod(
+                                        adapter, "getItem", i);
+                                if (task != null) {
+                                    XposedHelpers.callMethod(task, "p0", i == focus);
+                                }
+                            }
                             zoomFourFocus(container, adapter, param.args[1]);
                         } else {
+                            menuShrunk.put(container, Boolean.TRUE);
                             fourZoomed.put(container, Boolean.FALSE);
-                            XposedHelpers.callMethod(param.args[1], "p0", false);
-                            fitFour(container, 450);
+                            for (int i = 0; i < total; i++) {
+                                Object task = XposedHelpers.callMethod(
+                                        adapter, "getItem", i);
+                                if (task != null) {
+                                    XposedHelpers.callMethod(task, "p0", false);
+                                }
+                            }
+                            if (total == 4) fitFour(container, 450);
+                            else fitThree(container, 450);
                         }
                         param.setResult(null);
-                        log("four zoom " + (enlarge ? "in" : "out"));
+                        log("window zoom " + (enlarge ? "in" : "out") + " count=" + total);
                     } catch (Throwable error) {
-                        log("four zoom failed: " + error);
+                        log("window zoom failed: " + error);
                     }
                 }
             });
@@ -249,6 +347,168 @@ final class CanvasLayout {
         }
     }
 
+    /** 画布内容的整体矩形。 */
+    private static Rect contentRect(Object container) {
+        try {
+            Object rects = XposedHelpers.getObjectField(container, "l");
+            if (!(rects instanceof java.util.List)) return null;
+            Rect union = new Rect();
+            boolean any = false;
+            for (Object item : (java.util.List<?>) rects) {
+                if (item instanceof Rect) {
+                    union.union((Rect) item);
+                    any = true;
+                }
+            }
+            return any ? union : null;
+        } catch (Throwable error) {
+            return null;
+        }
+    }
+
+    /** 放大时按焦点窗口的位置算平移量，装不下就顶部对齐。 */
+    private static float focusAlign(Object container, Object adapter, Rect union,
+                                    float scale, int viewTop, float topInset,
+                                    float bottomInset, int parentHeight) {
+        try {
+            Object focus = XposedHelpers.callMethod(adapter, "h");
+            if (!(focus instanceof Integer)) return Float.NaN;
+            Object rects = XposedHelpers.getObjectField(container, "l");
+            if (!(rects instanceof java.util.List)) return Float.NaN;
+            java.util.List<?> list = (java.util.List<?>) rects;
+            int index = (Integer) focus;
+            if (index < 0 || index >= list.size()) return Float.NaN;
+            Object item = list.get(index);
+            if (!(item instanceof Rect)) return Float.NaN;
+            Rect rect = (Rect) item;
+            float top = (viewTop + rect.top) * scale;
+            float height = (rect.bottom - rect.top) * scale;
+            float avail = parentHeight - topInset - bottomInset;
+            if (height <= avail) {
+                return topInset + (avail - height) / 2f - top;
+            }
+            return topInset - top;
+        } catch (Throwable error) {
+            return Float.NaN;
+        }
+    }
+
+    /** 布局后的基准平移量，输入法偏移以它为原点。 */
+    private static final java.util.WeakHashMap<Object, Float> layoutTy =
+            new java.util.WeakHashMap<>();
+
+    /** 输入法正把画布抬高。只有这时才需要补挖洞，平时别碰框架原本的触摸区域。 */
+    private static volatile boolean imeActive;
+
+    /**
+     * 有人正在"只切焦点"地调 T()（目前只有 AutoReplace 的三分屏初始焦点）。
+     *
+     * 为什么需要这个标志：T(index, 450, mode, true) 既是"用户点了第 index 个窗口"，
+     * 也是"程序化切焦点"的唯一入口。v0.2.0 把 T() 当成点击处理后（同步 fourZoomed、
+     * 给每个 task 设 p0、再 N2），程序化切焦点会把刚建立的三窗总览顶成放大态。
+     * 包内静态标志是最小侵入的做法，不需要改 AutoReplace 的调用参数语义。
+     */
+    static volatile boolean programmaticFocus = false;
+
+    /**
+     * 输入法高度变化：o1(int) 是画布自己从 window insets 里读到的 IME 高度，
+     * 键盘弹出时把画布往上抬到焦点窗口底边露出来，收起回到基准位置。
+     *
+     * 为什么不用系统的 adjustFlexiblePositionForIme：画布这边实际被调的是这个
+     * o1(int)（OnApplyWindowInsetsListener 里调），系统那条在本机不触发；
+     * 而 ContainerView.getRootWindowInsets() 取到的 IME 一直是 0（踩过），
+     * 所以只能借画布自己算出来的这个值。
+     */
+    private static void shiftForIme(XC_MethodHook.MethodHookParam param) {
+        try {
+            int ime = (Integer) param.args[0];
+            Object view = XposedHelpers.callMethod(param.thisObject, "x0");
+            if (view == null) return;
+            Float base = layoutTy.get(view);
+            if (base == null) return;
+            android.view.View parent = (android.view.View)
+                    ((android.view.View) view).getParent();
+            if (parent == null) return;
+            int shift = 0;
+            // 二窗是系统原生分屏，键盘交给系统自己处理，这里只增强三窗和四窗
+            Object adapter = fieldOfType(view, "u1.c");
+            if (ime > 200 && adapter != null && count(adapter) >= 3) {
+                shift = coveredByIme(view, parent, base, ime);
+                if (shift < 0) shift = ime;
+                shift = Math.min(shift, ime);
+            }
+            parent.setTranslationY(base - shift);
+            imeActive = shift > 0;
+            log("ime shift " + shift);
+        } catch (Throwable error) {
+            log("ime shift failed: " + error);
+        }
+    }
+
+    /**
+     * 焦点窗口被键盘挡住的高度。view 可能已经停在上一轮的抬升位置上，
+     * 先减掉当前的偏移量换回原位再算。算不出来返回 -1，调用方按抬满处理。
+     */
+    private static int coveredByIme(Object container, android.view.View parent,
+                                    float base, int ime) {
+        try {
+            Object adapter = fieldOfType(container, "u1.c");
+            if (adapter == null) return -1;
+            int total = count(adapter);
+            if (total < 2) return -1;
+            Object focus = XposedHelpers.callMethod(adapter, "h");
+            int index = focus instanceof Integer ? (Integer) focus : 0;
+            if (index < 0 || index >= total) index = 0;
+            Object decor = XposedHelpers.callMethod(container, "q0", index);
+            if (decor == null) return -1;
+            Object taskView = XposedHelpers.callMethod(decor, "getFlexibleTaskView");
+            if (!(taskView instanceof android.view.View)) return -1;
+            Rect rect = new Rect();
+            XposedHelpers.callMethod(taskView, "getBoundsOnScreen", rect);
+            if (rect.isEmpty()) return -1;
+            float delta = parent.getTranslationY() - base;
+            int bottom = Math.round(rect.bottom - delta);
+            int keyboardTop = parent.getHeight() - ime;
+            return Math.max(0, bottom - keyboardTop);
+        } catch (Throwable error) {
+            return -1;
+        }
+    }
+
+    /** 画布上下留的边距。 */
+    private static int marginPx() {
+        return Math.round(20f * android.content.res.Resources
+                .getSystem().getDisplayMetrics().density);
+    }
+
+    /**
+     * 三窗总览：内容整体缩放到可用区域。
+     *
+     * 只在两处调用：用户在窗口菜单点"缩小窗口"，以及四窗关一窗回到三窗
+     * （2×2 的缩放值套三窗矩形会溢出）。三窗触发/回前台**不**走这里——
+     * 用户 2026-11-20 明确要求：触发后就是放大态，总览由用户自己点菜单缩。
+     */
+    private static void fitThree(Object container, int duration) {
+        try {
+            Object adapter = fieldOfType(container, "u1.c");
+            if (adapter == null || count(adapter) != 3) return;
+            Rect union = contentRect(container);
+            if (union == null) return;
+            android.view.View view = (android.view.View) container;
+            android.view.View parent = (android.view.View) view.getParent();
+            if (parent == null) return;
+            float avail = parent.getHeight() - statusBarHeight() - marginPx() * 2f;
+            float scale = Math.min((float) parent.getWidth() / union.width(),
+                    avail / union.height());
+            if (scale <= 0f || scale > 1f) return;
+            // 平移量由 A2 的 hook 统一算
+            XposedHelpers.callMethod(container, "A2", 0f, 0f, scale, duration, 0);
+            log("three fit scale=" + scale);
+        } catch (Throwable error) {
+            log("three fit failed: " + error);
+        }
+    }
+
     /** 四等分：画布缩放到 2×2 总尺寸正好放进屏幕。 */
     private static void fitFour(Object container, int duration) {
         try {
@@ -258,10 +518,15 @@ final class CanvasLayout {
             int gap = Math.round(10f * android.content.res.Resources
                     .getSystem().getDisplayMetrics().density);
             android.view.View view = (android.view.View) container;
+            android.view.View parent = (android.view.View) view.getParent();
+            if (parent == null) return;
+            // 上下各留一点，别贴着状态栏和屏幕底（A2 的 hook 会按这个余量居中）
+            float avail = parent.getHeight() - statusBarHeight() - marginPx() * 2;
             float fit = Math.min(
                     (float) view.getWidth() / (2 * cell.width() + gap),
-                    (float) view.getHeight() / (2 * cell.height() + gap));
+                    avail / (2 * cell.height() + gap));
             if (fit <= 0f || fit > 1f) return;
+            // 平移量交给 A2 的 hook 统一算
             XposedHelpers.callMethod(container, "A2", 0f, 0f, fit, duration, 4);
         } catch (Throwable error) {
             log("four fit failed: " + error);
@@ -948,7 +1213,6 @@ final class CanvasLayout {
 
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     forcePhoneSize(param.thisObject);
-                    broadcastState(true);
                     oLock = false;
                     if (forcedOrientation != 0) {
                         relayoutDirected(param.thisObject,
@@ -957,13 +1221,16 @@ final class CanvasLayout {
                     if (multiWindowMode) dumpLayout(param.thisObject);
                     try {
                         Object adapter = fieldOfType(param.thisObject, "u1.c");
-                        if (adapter != null && count(adapter) == 4) {
-                            final Object canvas = param.thisObject;
-                            if (!isFourZoomed(canvas)) {
-                                new android.os.Handler(android.os.Looper.getMainLooper())
-                                        .post(() -> fitFour(canvas, 0));
-                            }
-                        }
+                        if (adapter == null) return;
+                        final int panes = count(adapter);
+                        // 只有四窗默认进总览。三窗保持官方行为：触发后就是"一个大窗 +
+                        // 两个小窗"的放大态，想要总览由用户点窗口菜单的"缩小窗口"。
+                        // （上游 v0.2.0 是三窗也自动缩成总览，用户 2026-11-20 明确否掉：
+                        //  触发后应该是放大的状态。）
+                        if (panes != 4 || isFourZoomed(param.thisObject)) return;
+                        final Object canvas = param.thisObject;
+                        new android.os.Handler(android.os.Looper.getMainLooper())
+                                .post(() -> fitFour(canvas, 0));
                     } catch (Throwable ignored) {
                     }
                 }
@@ -1172,47 +1439,32 @@ final class CanvasLayout {
         }
     }
 
-    /** 画布可见性广播给侧边栏，侧边栏据此决定点应用是加画布还是开小窗。 */
-    /** 当前画布里有多少个窗口，没有画布返回 -1。 */
-    private static int currentCanvasCount() {
-        for (Object container : containers.keySet()) {
-            try {
-                Object adapter = fieldOfType(container, "u1.c");
-                if (adapter != null) return count(adapter);
-            } catch (Throwable ignored) {
-            }
-        }
-        return -1;
-    }
-
-    /** 画布当前是否在前台，watchdog 心跳用它，别再固定报 true。 */
-    private static volatile boolean canvasVisibleState = false;
-
-    private static void broadcastState(boolean visible) {
-        canvasVisibleState = visible;
+    /**
+     * 画布固定竖屏，不跟随手机旋转。
+     *
+     * 现象：手机一横，画布跟着横过来，三窗/四窗的比例全乱。
+     * 原因：pscanvas 自己会按画布内窗口的 requestedOrientation 调
+     * setRequestedOrientation，窗口都是竖屏或"未指定"时它传 -1，
+     * 画布的方向就交给 sensor 了。
+     * 解法（对齐上游 v0.2.0）：拦 ContainerActivity 的所有方向设置，统一改成竖屏；
+     * onResume 时主动触发一次，让画布启动即锁定。
+     */
+    private static void lockPortrait(ClassLoader loader) {
         try {
-            Object ctx = XposedHelpers.callStaticMethod(
-                    XposedHelpers.findClass("android.app.ActivityThread", null),
-                    "currentApplication");
-            if (!(ctx instanceof android.content.Context)) return;
-            int count = currentCanvasCount();
-            Intent state = new Intent("com.canvasplus.CANVAS_STATE");
-            state.setPackage("com.coloros.smartsidebar");
-            state.putExtra("visible", visible);
-            state.putExtra("count", count);
-            ((android.content.Context) ctx).sendBroadcast(state);
-            // 坑（2026-11-19）：system_server 里的 Trigger 也要拿窗口数：
-            // 两窗时让 FeatureUnlock 保持系统原生的手机布局策略，否则平板
-            // 策略会把窗口压窄并留黑边。显式发 "android" 包，不能只靠
-            // 智能侧边栏那条定向广播。
-            Intent systemState = new Intent("com.canvasplus.CANVAS_STATE");
-            systemState.setPackage("android");
-            systemState.putExtra("visible", visible);
-            systemState.putExtra("count", count);
-            ((android.content.Context) ctx).sendBroadcast(systemState);
-            log("canvas state " + visible + " count=" + count);
+            XposedHelpers.findAndHookMethod("android.app.Activity", loader,
+                    "setRequestedOrientation", int.class, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!CONTAINER_ACTIVITY.equals(
+                                    param.thisObject.getClass().getName())) {
+                                return;
+                            }
+                            param.args[0] = android.content.pm.ActivityInfo
+                                    .SCREEN_ORIENTATION_PORTRAIT;
+                        }
+                    });
+            log("portrait locked");
         } catch (Throwable error) {
-            log("canvas state broadcast failed: " + error);
+            log("portrait lock failed: " + error);
         }
     }
 
@@ -1223,7 +1475,13 @@ final class CanvasLayout {
                     "com.oplus.pscanvas.canvasmode.canvas.ContainerActivity", loader);
             XposedHelpers.findAndHookMethod(activity, "onResume", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
-                    broadcastState(true);
+                    try {
+                        // 触发一次方向设置，具体值由 lockPortrait 统一改成竖屏
+                        XposedHelpers.callMethod(param.thisObject,
+                                "setRequestedOrientation",
+                                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+                    } catch (Throwable ignored) {
+                    }
                     try {
                         Object view = XposedHelpers.callMethod(param.thisObject, "x0");
                         if (view == null) return;
@@ -1232,9 +1490,17 @@ final class CanvasLayout {
                                     try {
                                         attempts = 0;
                                         syncTaskData(view);
+                                        // 二窗是系统原生分屏，重排和看门狗都留给系统。
+                                        // 以前这里对两窗也调 N2()+watchdog，会和
+                                        // 两窗的 O2 布局互相打架（rectFList 被换掉）。
+                                        Object adapter = fieldOfType(view, "u1.c");
+                                        if (adapter == null || count(adapter) < 3) return;
                                         forcePhoneSize(view);
                                         XposedHelpers.callMethod(view, "N2");
                                         startWatchdog(view);
+                                        // 三窗回来时不主动缩放：保持用户当前的放大/总览状态。
+                                        // 上游 v0.2.0 这里无条件 fitThreeDefault（回前台就缩成总览），
+                                        // 与用户要的"触发后就是放大态"相反，已去掉。
                                     } catch (Throwable error) {
                                         log("resume reapply failed: " + error);
                                     }
@@ -1243,9 +1509,10 @@ final class CanvasLayout {
                     }
                 }
             });
-            XposedHelpers.findAndHookMethod(activity, "onPause", new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam param) {
-                    broadcastState(false);
+            // 输入法高度回调：画布自己从 window insets 里读到的 IME 高度就走这里
+            XposedBridge.hookAllMethods(activity, "o1", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    shiftForIme(param);
                 }
             });
             log("resume hooked");
@@ -1258,6 +1525,71 @@ final class CanvasLayout {
     private static void hookClick(ClassLoader loader) {
         try {
             Class<?> view = XposedHelpers.findClass(CONTAINER_VIEW, loader);
+            /**
+             * 三窗/四窗的缩放平移量统一在这里算（对齐上游 v0.2.0）。
+             *
+             * 为什么必须在这里干预：A2(tx, ty, scale, duration, mode) 由各处调用，
+             * tx/ty 都是相对 view 自身的，而 pivot 是 (0,0)，view 自己的 top
+             * 会被 scale 一起缩掉，所以"看起来居中"的 ty 其实会把内容顶到状态栏上。
+             * 另外总览缩放时官方只给了 0,0，内容贴着左边和状态栏，下面是空白，
+             * 观感像"没缩放成功"。
+             *
+             * 两条分支：
+             *   放得下 → 上下左右居中；
+             *   放不下（有窗口被放大）→ 按焦点窗口摆，保证它的底边不出屏。
+             *
+             * 只对 total>=3 生效：二窗是系统原生分屏，布局交给 O2。
+             * mode==3 是输入法上移，官方已经算好 ty，重算会把键盘抵消掉（踩过）。
+             */
+            XposedBridge.hookAllMethods(view, "A2", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        int mode = (Integer) param.args[4];
+                        if (mode == 3) return;
+                        Object adapter = fieldOfType(param.thisObject, "u1.c");
+                        if (adapter == null) return;
+                        int total = count(adapter);
+                        if (total < 3) return;
+                        float scale = (Float) param.args[2];
+                        if (scale <= 0f) return;
+                        android.view.View self = (android.view.View) param.thisObject;
+                        android.view.View parent = (android.view.View) self.getParent();
+                        Rect union = contentRect(param.thisObject);
+                        if (union == null || parent == null) return;
+
+                        int margin = marginPx();
+                        float topInset = statusBarHeight() + margin;
+                        float bottomInset = margin;
+                        // pivot 是 (0,0)，view 自己的 top 会被缩放吃掉，先补回来
+                        float base = topInset - self.getTop() * scale;
+                        float avail = parent.getHeight() - topInset - bottomInset;
+                        float drawn = union.height() * scale;
+                        float ty;
+                        if (drawn <= avail + 1f) {
+                            // 整体放得下：上下左右都居中
+                            ty = base + (avail - drawn) / 2f;
+                            float width = union.width() * scale;
+                            if (width < parent.getWidth()) {
+                                param.args[0] = (parent.getWidth() - width) / 2f;
+                            }
+                        } else {
+                            // 有窗口放大：按焦点窗口摆，别让它的底边跑出屏幕
+                            ty = focusAlign(param.thisObject, adapter, union, scale,
+                                    self.getTop(), topInset, bottomInset,
+                                    parent.getHeight());
+                            if (Float.isNaN(ty)) {
+                                ty = (Float) param.args[1] + base;
+                            }
+                        }
+                        param.args[1] = ty;
+                        layoutTy.put(param.thisObject, ty);
+                        log("A2 align ty=" + Math.round(ty) + " drawn=" + Math.round(drawn)
+                                + " avail=" + Math.round(avail));
+                    } catch (Throwable error) {
+                        log("A2 align failed: " + error);
+                    }
+                }
+            });
             XposedHelpers.findAndHookMethod(view, "T",
                     int.class, int.class, int.class, boolean.class, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam param) {
@@ -1266,9 +1598,18 @@ final class CanvasLayout {
                             boolean animate = (Boolean) param.args[3];
                             try {
                                 Object adapter = fieldOfType(param.thisObject, "u1.c");
-                                // onLayout 每次都自动聚焦缩放，四窗默认要保持四等分
-                                if (adapter != null && count(adapter) == 4
-                                        && duration == 0 && !isFourZoomed(param.thisObject)) {
+                                // onLayout 每次都自动聚焦缩放，总览态要保持总览。
+                                int panes = adapter == null ? 0 : count(adapter);
+                                // 四窗：没点放大之前一直保持四等分
+                                boolean shrunkFour = panes == 4
+                                        && !isFourZoomed(param.thisObject);
+                                // 三窗：默认就是放大态（触发即放大），只有用户自己
+                                // 从窗口菜单缩成总览后才拦住 onLayout 的自动放大，
+                                // 否则焦点一变就被拉回放大，总览点了没反应。
+                                boolean shrunkThree = panes == 3
+                                        && Boolean.TRUE.equals(menuShrunk.get(param.thisObject));
+                                if (adapter != null && duration == 0
+                                        && (shrunkFour || shrunkThree)) {
                                     param.setResult(Boolean.FALSE);
                                     return;
                                 }
@@ -1278,16 +1619,11 @@ final class CanvasLayout {
                             try {
                                 Object adapter = fieldOfType(param.thisObject, "u1.c");
                                 int total = adapter == null ? 0 : count(adapter);
-                                if (total == 4) {
-                                    // 四窗点窗口就是放大：同步状态，菜单才会变成"缩小窗口"
-                                    fourZoomed.put(param.thisObject, Boolean.TRUE);
-                                    for (int i = 0; i < total; i++) {
-                                        Object task = XposedHelpers.callMethod(
-                                                adapter, "getItem", i);
-                                        if (task != null) {
-                                            XposedHelpers.callMethod(task, "p0", i == index);
-                                        }
-                                    }
+                                // 程序化切焦点（AutoReplace 的三分屏初始焦点）：
+                                // 只让原实现跑，不动 fourZoomed/p0，也不补 N2，
+                                // 否则总览会被当成"点了窗口放大"。
+                                if (programmaticFocus) {
+                                    log("T focus-only " + index + ", keep overview");
                                     return;
                                 }
                                 // 坑：两窗点窗口绝不能调 N2()。N2 是三窗布局方法，
@@ -1296,11 +1632,10 @@ final class CanvasLayout {
                                 // 清空/换成三窗矩形，导致 autoScale 报 "rectFList is null"、
                                 // 点小窗无法翻转。
                                 if (total == 2) {
-                                    // 需求：点窗口就放大该窗口（含 50:50 时也放大），
-                                    // 且每个窗口只在第一次放大——自动和点击共用 enlargedTasks，
-                                    // 记账统一在 doAutoEnlargeTwo 内部按实际放大的 task 做，
-                                    // 这里不再单独记账，避免"自动放大虎扑没记 task → 点击又放大"。
-                                    // T() 会把焦点切到被点窗口，很短延迟等焦点切完即可。
+                                    // 本项目的两窗增强（上游 v0.2.0 是交回系统原生）：
+                                    // 点窗口就放大该窗口，每个窗口只在第一次放大——
+                                    // 自动和点击共用 enlargedTasks，记账统一在
+                                    // doAutoEnlargeTwo 内部按实际放大的 task 做。
                                     Object clickedTask = XposedHelpers.callMethod(
                                             adapter, "getItem", index);
                                     if (clickedTask == null) return;
@@ -1317,6 +1652,35 @@ final class CanvasLayout {
                                     return;
                                 }
                                 if (total < 3) return;
+                                // 从菜单缩小之后，点击窗口只切焦点，放大走窗口菜单
+                                if (noClickZoom()
+                                        && Boolean.TRUE.equals(
+                                                menuShrunk.get(param.thisObject))) {
+                                    int mode = (Integer) param.args[2];
+                                    boolean focus = (Boolean) param.args[3];
+                                    if (focus && mode != 2) {
+                                        XposedHelpers.callMethod(adapter, "I", index);
+                                    }
+                                    param.setResult(Boolean.FALSE);
+                                    log("click zoom skipped");
+                                    return;
+                                }
+                                // 三窗/四窗点窗口就是放大：同步每个 task 的 p0(),
+                                // 菜单才会显示成"缩小窗口"。三窗原来漏了这一步，
+                                // 点了放大菜单还停在放大态，要再点一次才缩回去。
+                                if (total == 3 || total == 4) {
+                                    // 用户主动点窗口放大，就不再是"手动缩小"状态
+                                    menuShrunk.remove(param.thisObject);
+                                    fourZoomed.put(param.thisObject, Boolean.TRUE);
+                                    for (int i = 0; i < total; i++) {
+                                        Object task = XposedHelpers.callMethod(
+                                                adapter, "getItem", i);
+                                        if (task != null) {
+                                            XposedHelpers.callMethod(task, "p0", i == index);
+                                        }
+                                    }
+                                    if (total == 4) return;
+                                }
                                 layoutKeys.remove(param.thisObject);
                                 XposedHelpers.callMethod(param.thisObject, "N2");
                             } catch (Throwable error) {
@@ -1333,7 +1697,13 @@ final class CanvasLayout {
     private static final java.util.WeakHashMap<Object, Boolean> watchdogs =
             new java.util.WeakHashMap<>();
 
-    /** 定期检查任务尺寸，同时给侧边栏发心跳：只在画布可见时发。 */
+    /**
+     * 定期检查任务尺寸，画布切回来以后任务可能被系统恢复成全屏。
+     *
+     * 这里原来每秒还要给侧边栏发一次 CANVAS_STATE 心跳（含着 isShown() 的可见性）。
+     * 对齐上游 v0.2.0 后侧边栏改成"当场问画布"，心跳整条链路已删除：
+     * 少了每秒两条跨进程广播，也不会再出现"侧边栏拿到旧状态误判"的问题。
+     */
     private static void startWatchdog(Object view) {
         if (watchdogs.containsKey(view)) return;
         watchdogs.put(view, Boolean.TRUE);
@@ -1344,44 +1714,12 @@ final class CanvasLayout {
                 try {
                     syncTaskData(view);
                     forcePhoneSize(view);
-                    broadcastState(canvasShown(view));
                 } catch (Throwable ignored) {
                 }
                 handler.postDelayed(this, 1000);
             }
         }, 500);
         log("watchdog started");
-    }
-
-    /**
-     * 画布窗口当前是不是可见，决定侧边栏点应用是"加进画布"还是"开小窗"。
-     *
-     * 坑：原实现用 context.isVisible()，在本机（ColorOS 16 / PKR110）恒为 false，
-     * 导致心跳永远 false、侧边栏永远当成"画布不在前台"，加第三个程序失效。
-     * 改用 View.isShown()：它综合自身/父级 VISIBLE 状态和是否 attach 到 window，
-     * 侧边栏悬浮窗盖上来时画布容器仍然 shown，切到别的应用才变 false。
-     */
-    private static boolean canvasShown(Object view) {
-        try {
-            if (!(view instanceof android.view.View)) return false;
-            android.view.View v = (android.view.View) view;
-            boolean shown = v.isShown();
-            if (shown) return true;
-            // 兜底：某些时机 isShown 还没跟上，用 windowVisibility + attach 状态补
-            try {
-                boolean attached = XposedHelpers.callMethod(v, "isAttachedToWindow")
-                        instanceof Boolean
-                        && (Boolean) XposedHelpers.callMethod(v, "isAttachedToWindow");
-                Object wv = XposedHelpers.callMethod(v, "getWindowVisibility");
-                if (attached && wv instanceof Integer && (Integer) wv == android.view.View.VISIBLE) {
-                    return true;
-                }
-            } catch (Throwable ignored) {
-            }
-            return false;
-        } catch (Throwable error) {
-            return false;
-        }
     }
 
     /** 三窗四窗都用整屏比例的任务，窗口大小由布局决定。 */
@@ -1421,6 +1759,13 @@ final class CanvasLayout {
             boolean justLeftThree = last != null && last >= 3 && count < 3;
             if (last != null && last != count) {
                 layoutKeys.remove(container);
+                // 四窗总览是 2×2 的缩放值，关掉一个窗口后画布还停在这个比例上，
+                // 三窗矩形塞不进去画面就是坏的。这里按三窗重新算一次总览。
+                if (last == 4 && count == 3 && !isFourZoomed(container)) {
+                    final Object canvas = container;
+                    new android.os.Handler(android.os.Looper.getMainLooper())
+                            .post(() -> fitThree(canvas, 0));
+                }
             }
             taskCounts.put(container, count);
             windowCount = count;
@@ -1713,6 +2058,10 @@ final class CanvasLayout {
             Class<?> adapter = XposedHelpers.findClass("u1.c", loader);
             XposedBridge.hookAllMethods(adapter, "j", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
+                    // 二窗是系统原生分屏，布局方向交给原版。
+                    // 无条件返回 false 会让两窗也走"一线布局"，观感是上下等分变成一条竖排
+                    //（对齐上游 v0.2.0：只在三窗及以上关闭一线布局）。
+                    if (count(param.thisObject) < 3) return;
                     param.setResult(Boolean.FALSE);
                 }
             });
