@@ -210,6 +210,42 @@ NPE，画布进程崩掉，表现是"点交换，当前应用突然全屏"。
 `layoutKey` 里加上 `task.k()`（应用标识）和 `task.t()`（taskId）。同应用内换页
 时这两个不变，防抖照旧；替换成别的应用后 key 变化，重排正常触发。
 
+### 系统「替换应用」为什么不会被 -92 拦（2026-11-19 逆向结论）
+
+想让第三方应用占画布一个窗口时，直接 `startPocketStudio(intents)` 从零 embedded
+启动会被 `atms_intercept` 用 -92 拒绝（换任何包名都一样）。但菜单"替换应用"
+却能把任意应用放进去。完整链路（oplus-services.jar classes3.dex + pscanvas
+classes.dex）：
+
+1. 应用选择器先把目标应用**普通启动成一个独立 task**，拿到真实 taskId；
+2. system_server `OplusFlexibleWindowMinimizedManagerHelper
+   .startReplaceSplitWhenNormal(int taskId, Intent, int userId, int index)`，
+   或 `OplusSplitScreenManagerService.splitScreenForApplication` 同名路径；
+3. 经 Binder `IEmbeddedWindowContainerCallback.startReplaceSplitWhenNormalSplit
+   (int taskId, Intent, int userId, int index)` 回调到 pscanvas；
+4. pscanvas `ContainerActivity$EmbeddedWindowCallback` 同名方法 → post 主线程
+   → `f0` → `j()` → `lambda$startReplaceSplitWhenNormalSplit$3`：若 intent 带
+   `androidx.flexible.replaceIntent`（旧应用 ComponentName.toShortString()）就遍历
+   现有 task 找匹配槽位，否则用传入 index；`EmbeddedViewDecor.setHasBeenReplaced(true)`；
+5. `ContainerActivity.c2(activity, taskId, intent, userId, index)` → `d2(...)`：
+   `B1.l.n0(context, intent, ...)` 造新 `u1/d`，`taskData.l0(taskId)`/`s0(userId)`，
+   从旧槽位迁移 rect/bounds，再 `s0` 替换该位置 → `notifyDataSetChanged`。
+
+**本质：替换只是"用新 intent 更新已有窗口槽位的 task"，不新建 embedded 窗口**，
+所以绕过 -92。这点解释了"之前包名能跑通、换包名不行"的疑惑——不是包名问题，
+是 from-scratch embedded 启动 vs 复用已有槽位的区别。
+
+实测（探针 hook `startReplaceSplitWhenNormalSplit` 和 `c2` 抓参）：
+- 直接调 `c2(activity, -1, intent, userId, slot)` 传 taskId=-1 会让系统在画布外
+  新建 task 并全屏显示，**且会留下一个 force-stop 都清不掉的半屏幽灵窗口**
+  （只能重启设备/系统框架清）。务必传目标应用已存在的真实 taskId。
+- pscanvas 进程内 `ActivityTaskManager.getRecentTasks/getTasks` 返回空，拿不到目标
+  taskId；system_server（android 作用域）能拿到。所以自动化替换的 taskId 获取
+  要么放 system_server 侧，要么从 Intent extra `androidx.activity.LaunchEmbeddedTaskId`
+  取。system_server 侧改动需用户手动重启系统框架才生效。
+- 探针类 `ReplaceProbe.java` 与 REPLACE/DUMPTASKS 广播本轮已回退删除，代码库回到
+  三包成功版本。若以后要正式做这个功能，从 system_server 侧拿 taskId 再走 c2。
+
 ### 三窗隐藏放大/缩小菜单
 
 窗口菜单在 `t.e0()` 里构建，末尾统一 add 进 `t.W`。三窗时在 after 里

@@ -15,16 +15,26 @@ import java.util.List;
 import de.robv.android.xposed.XposedHelpers;
 
 /**
- * 广播入口。
+ * 广播入口。START/ADD/LAYOUT 三个 action。
  *
- * START：
- *   adb shell am broadcast -a com.canvasplus.START \
- *       --esa packages com.tencent.mm,com.tencent.mobileqq,com.android.settings
- *   1. FlexibleWindowManager.startPocketStudio 拉起画布容器
- *   2. 逐个调 startFlexibleWindowForRecentTasks 把已有 task 变成灵活窗口
+ * START：把广播传入的包名原样交给 startPocketStudio 拉起画布。
+ * 曾尝试改写槽位放伪桌面，但第三方 Activity 作为 embedded 窗口启动会被
+ * ColorOS 的 atms_intercept 用 -92 拒绝（普通包名也一样），已回滚到原始逻辑。
  *
- * ADD：把单个应用加进正在运行的画布，智能侧边栏走这条。
- * LAYOUT：切三窗布局方向。
+ * ===== 三屏 + 下窗焦点展开的触发方法（2026-11-20 实测确认，勿删） =====
+ * 命令：
+ *   am broadcast -a com.canvasplus.START \
+ *       --esa packages <上窗包>,<下窗包> \
+ *       --ez foreground true --ei mode 4
+ * - foreground=true：第一个包由 foregroundPackage() 读当前前台应用（黑名单滤掉
+ *   画布/桌面/SystemUI），落到左侧窄窗。不要手写包名（酷安/Via 都是死配置）。
+ * - packages[1] → 上窗（小窗），packages[2] → 下窗（一触发就是焦点展开态）。
+ *   2026-11-20 实测：传 [计算器,翻译] 时下窗是翻译且展开；对调成 [翻译,计算器]
+ *   即可让计算器在下窗展开。目标不是「某个应用变大」，而是「下窗位置一触发
+ *   就展开」，装谁无所谓。
+ * - mode=4 交给 CanvasLayout 的三/四窗布局链路。
+ * 坑：force-stop pscanvas 后必须等 receiver 重新注册（日志出现 trigger armed）
+ * 再发广播，否则广播没人收、三窗起不来。
  */
 final class Trigger {
 
@@ -41,11 +51,6 @@ final class Trigger {
         arm(loader, 0);
     }
 
-    /**
-     * 画布进程刚起来时 currentApplication() 不一定有值，之前固定等 2 秒，
-     * 这段时间里侧边栏发来的 ADD 会直接丢掉（表现就是点好几下才有一次生效）。
-     * 改成尽快尝试，没有上下文就退避重试。
-     */
     private static void arm(final ClassLoader loader, final int attempt) {
         long delay = attempt == 0 ? 100L : 300L;
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
@@ -97,6 +102,24 @@ final class Trigger {
                     String[] packages = intent.getStringArrayExtra(EXTRA_PACKAGES);
                     if (packages == null || packages.length == 0) return;
                     CanvasLayout.forcedMode = intent.getIntExtra("mode", 0);
+
+                    // 2026-11-20 用户要求：侧窗（packages 第一个）用「触发前的前台应用」，
+                    // 不再写死酷安。广播带 foreground=true 时读取当前前台 task 的包名，
+                    // 用黑名单滤掉画布/桌面/SystemUI 后取最上面的一个，插到第一位。
+                    // 坑：画布起来后它自己会成为前台 task，所以必须靠黑名单把它排除，
+                    // 否则取到的是画布自己。另外两个包（Via/计算器）保持广播传入的值。
+                    if (intent.getBooleanExtra("foreground", false)) {
+                        String fg = foregroundPackage(loader);
+                        if (fg != null) {
+                            String[] withFg = new String[packages.length + 1];
+                            withFg[0] = fg;
+                            System.arraycopy(packages, 0, withFg, 1, packages.length);
+                            packages = withFg;
+                            log("foreground slot -> " + fg);
+                        } else {
+                            log("foreground package not found (all blacklisted?)");
+                        }
+                    }
                     log("trigger " + Arrays.toString(packages) + " mode=" + CanvasLayout.forcedMode);
                     startPocketStudio(context, loader, packages);
                     enterWorkspace(loader, packages);
@@ -113,12 +136,10 @@ final class Trigger {
         }
     }
 
-    /** 给画布发 AddIntentToSplit，让它自己走 addFlexibleTask 添加窗口。 */
-    /** 侧边栏点应用时，只有一个问题：现在该加进画布，还是照旧开小窗。 */
     private static void addToCanvas(android.content.Context context, String pkg) {
         addToCanvas(context, pkg, 0);
     }
-    /** 加完窗口后画布可能还在动画里没重排，补一次。 */
+
     private static void relayoutLater(final Object activity) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             try {
@@ -128,10 +149,6 @@ final class Trigger {
         }, 300L);
     }
 
-    /**
-     * 直接走 s0.d() 加窗口，绕开 ContainerActivity.j0() 里那些前置检查。
-     * j0 里只要有一步对不上就静默返回，表现就是"点了没反应"。
-     */
     private static boolean addDirect(Object activity, android.content.Context context,
                                      Intent launch) {
         try {
@@ -139,7 +156,6 @@ final class Trigger {
             if (view == null) return false;
             Object adapter = adapterOf(view);
             if (adapter == null) return false;
-            // s0 内部会把 context 强转成 ContainerActivity，必须传 Activity 本身
             Object taskData = XposedHelpers.callStaticMethod(
                     XposedHelpers.findClass("B1.l", activity.getClass().getClassLoader()),
                     "n0", activity, launch, -2, -1);
@@ -181,10 +197,6 @@ final class Trigger {
         return null;
     }
 
-    /**
-     * 加窗口。j0() 依赖 getRectList() 和 adapter 完全同步，画布刚起来或者
-     * 刚重排完时会对不上而静默返回。点一次内部退避重试几次，别让用户手点。
-     */
     private static void addToCanvas(final android.content.Context context, final String pkg,
                                     final int attempt) {
         try {
@@ -195,7 +207,6 @@ final class Trigger {
             }
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
-            // 画布已经在跑的时候，Intent 那条路进不了 addFlexibleTask，直接调
             Object activity = currentCanvas();
             if (activity != null) {
                 int before = canvasCount(activity);
@@ -216,7 +227,6 @@ final class Trigger {
                     log("j0 direct failed: " + error);
                 }
 
-                // j0 里那串前置检查（a2/rectList 对齐）比较脆，直接用 s0.d() 加
                 if (addDirect(activity, context, launch)) {
                     int now = canvasCount(activity);
                     log("direct add " + pkg + " " + before + "->" + now
@@ -251,7 +261,6 @@ final class Trigger {
         }
     }
 
-    /** 当前画布里的窗口数量。 */
     private static int canvasCount(Object activity) {
         try {
             Object view = XposedHelpers.callMethod(activity, "x0");
@@ -272,8 +281,6 @@ final class Trigger {
         }
     }
 
-    /** 找出当前活着的画布 Activity。 */
-    /** 找出当前活着的画布 Activity，多个画布时优先前台的。 */
     private static Object currentCanvas() {
         try {
             Object thread = XposedHelpers.callStaticMethod(
@@ -304,7 +311,6 @@ final class Trigger {
         return null;
     }
 
-    /** 拉起画布容器，让 pscanvas 进入可接收任务的状态。 */
     private static void startPocketStudio(Context context, ClassLoader loader, String[] packages) {
         try {
             Object manager = XposedHelpers.callStaticMethod(
@@ -312,8 +318,12 @@ final class Trigger {
             if (manager == null) return;
             List<Intent> intents = new ArrayList<>();
             for (String pkg : packages) {
+                // 回滚到原始版本：一律用普通的 launch intent，不构造伪桌面 intent。
                 Intent intent = context.getPackageManager().getLaunchIntentForPackage(pkg);
-                if (intent == null) continue;
+                if (intent == null) {
+                    log("no launch intent for " + pkg + ", skipped");
+                    continue;
+                }
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 intents.add(intent);
             }
@@ -329,7 +339,6 @@ final class Trigger {
         }
     }
 
-    /** 把最近任务里已有的实例逐个转成灵活窗口。 */
     private static void enterWorkspace(ClassLoader loader, String[] packages) {
         try {
             Object manager = XposedHelpers.callStaticMethod(
@@ -343,13 +352,10 @@ final class Trigger {
                 log("no recent tasks visible");
                 return;
             }
-
-            // 给全屏矩形，任务保持手机的原始比例，不做 resize。
             android.util.DisplayMetrics metrics = android.content.res.Resources
                     .getSystem().getDisplayMetrics();
             android.graphics.Rect full = new android.graphics.Rect(
                     0, 0, metrics.widthPixels, metrics.heightPixels);
-
             int entered = 0;
             for (String pkg : packages) {
                 Integer taskId = tasks.get(pkg);
@@ -372,7 +378,71 @@ final class Trigger {
         }
     }
 
-    /** 用 ActivityTaskManager 服务查最近任务，system_server 和画布进程都能调。 */
+    /**
+     * 读当前前台应用包名：取 ATMS task 列表第一个「不在黑名单」的包名。
+     * 黑名单必须含画布(pscanvas)和桌面(launcher)/SystemUI——画布启动后自身就是
+     * 最上面的 task，不排掉会把它当成前台应用塞进侧窗（2026-11-20 踩过）。
+     * 用 getTasks/getRecentTasks 的 MRU 顺序，第一个即前台；topActivity 可能为 null
+     * 时用 baseIntent 兜底。
+     */
+    private static String foregroundPackage(ClassLoader loader) {
+        java.util.List<String> order = new java.util.ArrayList<>();
+        try {
+            Object atms = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.app.ActivityTaskManager", loader),
+                    "getService");
+            Object value = null;
+            Object[][] attempts = new Object[][]{
+                    {Integer.MAX_VALUE, 0},
+                    {Integer.MAX_VALUE, 0, 0},
+                    {Integer.MAX_VALUE, false, false}
+            };
+            for (Object[] args : attempts) {
+                try {
+                    value = XposedHelpers.callMethod(atms, "getRecentTasks", args);
+                    if (value instanceof java.util.List) break;
+                } catch (Throwable ignored) {
+                }
+                try {
+                    value = XposedHelpers.callMethod(atms, "getTasks", args);
+                    if (value instanceof java.util.List) break;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (value instanceof java.util.List) {
+                for (Object info : (java.util.List<?>) value) {
+                    String pkg = null;
+                    try {
+                        Object top = XposedHelpers.getObjectField(info, "topActivity");
+                        if (top instanceof android.content.ComponentName) {
+                            pkg = ((android.content.ComponentName) top).getPackageName();
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    if (pkg == null) {
+                        Object intent = XposedHelpers.getObjectField(info, "baseIntent");
+                        if (intent instanceof Intent) pkg = ((Intent) intent).getPackage();
+                    }
+                    if (pkg != null && !pkg.isEmpty()) order.add(pkg);
+                }
+            }
+        } catch (Throwable error) {
+            log("foreground task scan failed: " + error);
+        }
+        log("foreground candidates=" + order);
+        for (String pkg : order) {
+            if (blacklisted(pkg)) continue;
+            return pkg;
+        }
+        return null;
+    }
+
+    private static boolean blacklisted(String pkg) {
+        return pkg.equals("com.oplus.pscanvas")
+                || pkg.equals("com.android.launcher")
+                || pkg.equals("com.android.systemui");
+    }
+
     private static java.util.HashMap<String, Integer> recentTasks(ClassLoader loader) {
         java.util.HashMap<String, Integer> out = new java.util.HashMap<>();
         try {

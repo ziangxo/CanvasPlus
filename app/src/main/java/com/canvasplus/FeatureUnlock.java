@@ -24,6 +24,22 @@ final class FeatureUnlock {
             "oplus.software.flexible.subdisplay.support"
     };
 
+    /**
+     * 系统侧的平板布局策略只在三窗及以上才允许生效。
+     *
+     * 坑（2026-11-19 用户实测确认）：勾选 system 作用域后，如果无条件把
+     * CanvasCalculateLayoutRect.isTabletDevice 强制为 true、getTaskLayoutPolicy
+     * 换成 mTabletCanvasLayoutPolicy，两窗时系统按平板算 rect、pscanvas 侧
+     * 却按手机摆（CanvasLayout.useTabletPolicy 里 !multiWindowMode 直接 return），
+     * 两边对不上，窗口被压窄且左右留黑边。取消 system 勾选即恢复正常。
+     * 这里由 pscanvas 广播的画布窗口数驱动：count>=3 才切平板策略。
+     */
+    private static volatile boolean tabletLayoutNeeded = false;
+
+    static void setTabletLayoutNeeded(boolean needed) {
+        tabletLayoutNeeded = needed;
+    }
+
     private FeatureUnlock() {}
 
     static void installSystem(ClassLoader loader) {
@@ -200,20 +216,32 @@ final class FeatureUnlock {
         }
     }
 
-    /** 系统侧的画布布局在 CanvasCalculateLayoutRect 里，默认按手机给，改成平板。 */
+    /** 系统侧的画布布局：只在三窗及以上才按平板算，两窗保留系统手机的原始算法。 */
     private static void unlockCanvasLayout(ClassLoader loader) {
         try {
             Class<?> type = XposedHelpers.findClass(
                     "com.oplus.flexiblewindow.CanvasCalculateLayoutRect", loader);
-            hookAll(type, new String[]{"isTabletDevice"}, Boolean.TRUE);
-            hookAll(type, new String[]{"isPhoneDisplay"}, Boolean.FALSE);
-            log("canvas layout -> tablet");
+            XposedBridge.hookAllMethods(type, "isTabletDevice", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    if (tabletLayoutNeeded && param.getResult() instanceof Boolean) {
+                        param.setResult(Boolean.TRUE);
+                    }
+                }
+            });
+            XposedBridge.hookAllMethods(type, "isPhoneDisplay", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    if (tabletLayoutNeeded && param.getResult() instanceof Boolean) {
+                        param.setResult(Boolean.FALSE);
+                    }
+                }
+            });
+            log("canvas layout -> tablet only when count>=3");
         } catch (Throwable error) {
             log("canvas layout unavailable: " + error);
         }
     }
 
-    /** 系统里给画布选布局策略，默认是手机那套，换成平板的。 */
+    /** 系统里给画布选布局策略：三窗及以上才换平板策略，两窗保持原样。 */
     private static void unlockTaskLayoutPolicy(ClassLoader loader) {
         try {
             Class<?> type = XposedHelpers.findClass(
@@ -221,6 +249,7 @@ final class FeatureUnlock {
             XposedBridge.hookAllMethods(type, "getTaskLayoutPolicy",
                     new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam param) {
+                            if (!tabletLayoutNeeded) return;
                             try {
                                 java.lang.reflect.Field field =
                                         param.thisObject.getClass()

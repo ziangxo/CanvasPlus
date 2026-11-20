@@ -36,6 +36,11 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
 
             case "com.oplus.pscanvas":
                 // 画布容器进程，布局问题的真正位置。
+                // 2026-11-20：移除 AutoReplace —— 不再用布局后 hook T() 模拟点击切焦点。
+                // 坑：实测 packages 顺序不决定大窗槽位（计算器放第 1 位大窗是翻译，放第 2 位
+                // 大窗又变成别的包），所以「计算器放第一个=大窗」是错误假设，已删除，禁止据此臆测。
+                // 大窗/焦点由系统逻辑决定，如何让指定应用直接成为大窗仍需基于可工作的放大
+                // 窗口模式（CanvasLayout.hookFourZoom）逆向验证，不能靠改 packages 排序碰运气。
                 CanvasLayout.install(param.classLoader);
                 Trigger.arm(param.classLoader);
                 break;

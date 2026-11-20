@@ -1040,6 +1040,17 @@ final class CanvasLayout {
                         new android.os.Handler(android.os.Looper.getMainLooper())
                                 .postDelayed(() -> {
                                     try {
+                                        // 坑（已修）：三窗启动会先经过 O2 摆好前 2 个窗口，
+                                        // 那时 count==2，如果直接放大就打断了第 3 个窗口加入，
+                                        // 导致"一步起三窗"只起来 2 个。这里延迟后二次确认：
+                                        // 窗口数必须仍然是 2 才是真二分屏，变 3+ 就跳过。
+                                        Object adapterNow = fieldOfType(container, "u1.c");
+                                        if (adapterNow == null || count(adapterNow) != 2) {
+                                            log("auto enlarge two skipped: not 2 anymore (count="
+                                                    + (adapterNow == null ? -1 : count(adapterNow))
+                                                    + ")");
+                                            return;
+                                        }
                                         if (Boolean.TRUE.equals(
                                                 twoAutoZoomed.get(container))) return;
                                         doAutoEnlargeTwo(container);
@@ -1184,12 +1195,22 @@ final class CanvasLayout {
                     XposedHelpers.findClass("android.app.ActivityThread", null),
                     "currentApplication");
             if (!(ctx instanceof android.content.Context)) return;
+            int count = currentCanvasCount();
             Intent state = new Intent("com.canvasplus.CANVAS_STATE");
             state.setPackage("com.coloros.smartsidebar");
             state.putExtra("visible", visible);
-            state.putExtra("count", currentCanvasCount());
+            state.putExtra("count", count);
             ((android.content.Context) ctx).sendBroadcast(state);
-            log("canvas state " + visible + " count=" + currentCanvasCount());
+            // 坑（2026-11-19）：system_server 里的 Trigger 也要拿窗口数：
+            // 两窗时让 FeatureUnlock 保持系统原生的手机布局策略，否则平板
+            // 策略会把窗口压窄并留黑边。显式发 "android" 包，不能只靠
+            // 智能侧边栏那条定向广播。
+            Intent systemState = new Intent("com.canvasplus.CANVAS_STATE");
+            systemState.setPackage("android");
+            systemState.putExtra("visible", visible);
+            systemState.putExtra("count", count);
+            ((android.content.Context) ctx).sendBroadcast(systemState);
+            log("canvas state " + visible + " count=" + count);
         } catch (Throwable error) {
             log("canvas state broadcast failed: " + error);
         }
