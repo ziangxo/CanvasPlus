@@ -263,10 +263,95 @@ final class CanvasLayout {
         try {
             Class<?> replacer = XposedHelpers.findClass(
                     "com.oplus.pscanvas.canvasmode.canvas.c", loader);
+
+            // 替换应用入口：c.n(ContainerView, Intent, int, int, int)。
+            // 置"替换中"标志，让随后的 c.m（来自新 task 的 TaskEvent）走原生，
+            // 不被当成菜单放大/缩小，避免三窗整体收缩再扩张。
+            XposedBridge.hookAllMethods(replacer, "n", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        // 只认替换应用那条签名：c.n(ContainerView, Intent, ...)（5 参数），
+                        // c 类里别的 n 重载不碰，避免误把普通操作也标成"替换中"。
+                        if (param.args == null || param.args.length != 5) return;
+                        if (!(param.args[1] instanceof Intent)) return;
+                        Object container = param.args[0];
+                        if (container == null) return;
+                        long until = System.currentTimeMillis() + REPLACE_GUARD_MS;
+                        replacingUntil.put(container, until);
+                        replaceAnimatingUntil = until;
+                        log("replace guard on (c.n)");
+                        // 遮罩缩放修复：拿到 CanvasMaskManager 实例（y1/n 在另一个
+                        // ClassLoader，findClass("y1/n") 会 ClassNotFound），从实例
+                        // 反取 Class 后懒 hook 一次它的 w(Z,Rect,Rect,I,List,I)。
+                        tryInstallMaskWHook(container);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+
+            // 关键修复：替换流程里强制 G0 返回 true，跳过"整体收缩再扩张"动画。
+            // B1/l.G0(List,List,Context)Z 只在 c.n 的替换动画判断里被这样调用；
+            // 用全局时间戳限定范围，不影响其它时机对 G0 的调用（若将来有别处调用，
+            // 因 replaceAnimatingUntil 为 0，一律放行原逻辑）。
+            try {
+                // 混淆类名必须用斜杠 "B1/l"：findClass 传点号 "B1.l" 会当成包名+类名
+                // 解析失败，hook 根本装不上（曾因此白改一版）。
+                Class<?> b1l = null;
+                try {
+                    b1l = XposedHelpers.findClass("B1/l", loader);
+                } catch (Throwable e) {
+                    try { b1l = XposedHelpers.findClass("B1.l", loader); } catch (Throwable ignored) { }
+                }
+                if (b1l == null) throw new RuntimeException("B1/l class not found");
+                XposedHelpers.findAndHookMethod(b1l, "G0",
+                        java.util.List.class, java.util.List.class,
+                        android.content.Context.class, new XC_MethodHook() {
+                            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (replaceAnimatingUntil > System.currentTimeMillis()) {
+                                        // G0 语义（dexdump 确认）：c.n 里 `if(G0==false) goto 01bf`
+                                        // 而 01bf 才是动画起点 → G0=false 会【播放】整体替换动画，
+                                        // G0=true 才是跳过。右下槽位矩形不变→原生G0返回false→播动画；
+                                        // 上窗矩形变化→原生G0返回true→直接打开。故强制 true。
+                                        param.setResult(true);
+                                        log("G0 forced true (skip replace animation)");
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                log("G0 hook installed on B1/l");
+
+                // 2026-11-21 教训：曾附加 hook B1/l.m1（setResult null）和 B1/l.f
+                // （改 animatingReplaceAnimation 标志）想消除"程序级缩小/遮罩缩放"动画，
+                // 但 m1 实测本机不触发、f 改标志也无效，且 setResult 掐断流程有卡死风险
+                // （后来 hook CanvasMaskManager.p0 就真的卡死了）。都已回退，只保留 G0=true。
+            } catch (Throwable t) {
+                log("G0 hook failed: " + t);
+            }
+
+            // 2026-11-21 教训：曾尝试 hook CanvasMaskManager(y1/n) 的 p0/r0 并
+            // setResult(null) 跳过遮罩动画，结果点击替换应用后画布卡死 ——
+            // p0 不只是动画，内部还有替换流程的收尾（清理遮罩/c$h.a()回调等），
+            // 掐断它整个流程就挂住。已回退这条 hook，遮罩动画保持原生。
+            // 结论：这个"启动遮罩朝目标窗口缩放再消失"是画布核心替换流程的一部分，
+            // 不能简单跳过；要改只能改 p0 内部的动画参数（风险高，暂不做）。
+
             XposedBridge.hookAllMethods(replacer, "m", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
                         Object container = param.args[0];
+                        // 替换应用进行中：放行原生 c.m，不动缩放/焦点/布局状态。
+                        // 这样替换后的 TaskEvent 不会触发 fitThree/zoomFourFocus，
+                        // 应用直接在目标窗口打开（与槽位 1 行为一致）。
+                        Long until = replacingUntil.get(container);
+                        if (until != null) {
+                            if (System.currentTimeMillis() < until) {
+                                log("window zoom skipped (replacing)");
+                                return; // 不 setResult → 原方法照常执行
+                            }
+                            replacingUntil.remove(container);
+                        }
                         Object adapter = fieldOfType(container, "u1.c");
                         if (adapter == null) return;
                         int total = count(adapter);
@@ -312,6 +397,57 @@ final class CanvasLayout {
             log("four zoom hooked");
         } catch (Throwable error) {
             log("four zoom hook failed: " + error);
+        }
+    }
+
+    /**
+     * 懒安装遮罩缩放修复 hook。
+     *
+     * 为什么懒装：y1/n（CanvasMaskManager）在画布另一个 ClassLoader 里，直接
+     * findClass("y1/n", loader) 会 ClassNotFound（踩过）。但 ContainerView 有
+     * getCanvasMaskManager():Ly1/n;，替换发生时该实例一定已创建，从实例 getClass()
+     * 拿到的就是正确 Class。
+     *
+     * 为什么 hook w 而不是 p0/r0：p0/r0 是转发壳，内部触发 onMaskShow/onMaskFull/
+     * onMaskHide 三个回调再调下一级，setResult(null) 会把回调一起掐掉 → 替换卡死
+     * （踩过）。而 w(Z,Rect,Rect,I,List,I) 是纯计算方法：内部 targetScaleX =
+     * args[2].width()/args[1].width()、targetTranslateX = args[2].left-args[1].left，
+     * 把 args[2] 换成 args[1] 的副本即可让 scale=1/位移=0，遮罩退化为上窗口那种
+     * "原地淡出"，且不动任何生命周期回调，不会卡死。
+     *
+     * 只在替换期（replaceAnimatingUntil）生效，别的时候一律放行原逻辑。
+     */
+    private static void tryInstallMaskWHook(final Object container) {
+        if (maskWHooked) return;
+        synchronized (CanvasLayout.class) {
+            if (maskWHooked) return;
+            try {
+                Object manager = XposedHelpers.callMethod(container, "getCanvasMaskManager");
+                if (manager == null) return;
+                Class<?> maskClass = manager.getClass();
+                XposedBridge.hookAllMethods(maskClass, "w", new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            // 只认精确签名 w(boolean,Rect,Rect,int,List,int)。
+                            // 该类还有别的同名/近似方法，参数不匹配就放行。
+                            Object[] a = param.args;
+                            if (a == null || a.length != 6) return;
+                            if (!(a[1] instanceof Rect) || !(a[2] instanceof Rect)) return;
+                            if (replaceAnimatingUntil <= System.currentTimeMillis()) return;
+                            Rect base = (Rect) a[1];
+                            // 把目标矩形换成基准矩形的副本：scale=1、位移=0，
+                            // 遮罩不再朝目标槽位角落收缩，而是原地淡出（同上窗口）。
+                            a[2] = new Rect(base);
+                            log("mask w neutralized (no zoom to corner)");
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                maskWHooked = true;
+                log("mask w hook installed on " + maskClass.getName());
+            } catch (Throwable t) {
+                log("mask w hook failed: " + t);
+            }
         }
     }
 
@@ -409,6 +545,37 @@ final class CanvasLayout {
      * 包内静态标志是最小侵入的做法，不需要改 AutoReplace 的调用参数语义。
      */
     static volatile boolean programmaticFocus = false;
+
+    /**
+     * 替换应用执行中（2026-11-21 用户反馈：三窗右下槽位替换应用后整体"收缩再扩张"）。
+     *
+     * 根因（dexdump + 真机日志确认）：替换面板选应用走 c.n(ContainerView, Intent,...)，
+     * c.n 内部按新旧布局矩形是否一致决定是否播"整体收缩再扩张"的替换动画。
+     * 右下槽位替换时矩形不变 → 播动画；上窗替换时矩形有变化 → 不播、直接打开。
+     *
+     * 修法：hook c.n 置这两个时间戳标志（6 秒窗口覆盖异步替换过程），
+     * 让 B1/l.G0 在替换期内强制返回 true 跳过整体动画。
+     *
+     * 排查踩坑记录（避免以后重犯）：
+     * - 最初误判为 c.m(TaskEvent) 触发 fitThree/zoomFourFocus → 实测 c.m 在替换期
+     *   根本没被调用，此路不通。
+     * - 试过 hook B1/l.m1（setResult null）和 B1/l.f（改 animatingReplaceAnimation 标志）
+     *   消除"程序级缩小/遮罩缩放"：m1 本机不触发、f 改标志无效。
+     * - 试过 hook CanvasMaskManager(y1/n) 的 p0/r0 并 setResult(null) → 点击替换直接卡死：
+     *   p0 内部还有替换流程收尾（清理遮罩/回调），掐断就挂。已回退。
+     *   写死 y1/n 类名也会 ClassNotFound（该类在另一个 ClassLoader）。
+     * - 最终结论：整体缩放由 G0=true 消除；"遮罩缩到角落"由 hook y1/n.w() 把
+     *   目标矩形换回基准矩形消除（见 tryInstallMaskWHook 的注释）。
+     *
+     * replacingUntil 按 container 记，避免一个画布替换误伤另一个；
+     * replaceAnimatingUntil 是全局的（G0 是静态方法、没有 container 参数）。
+     */
+    private static final java.util.WeakHashMap<Object, Long> replacingUntil =
+            new java.util.WeakHashMap<>();
+    private static final long REPLACE_GUARD_MS = 6000L;
+    private static volatile long replaceAnimatingUntil = 0L;
+    /** y1/n.w(...) 是否已 hook（该类在另一个 ClassLoader，拿到实例才取到 Class）。 */
+    private static volatile boolean maskWHooked = false;
 
     /**
      * 输入法高度变化：o1(int) 是画布自己从 window insets 里读到的 IME 高度，
@@ -1583,8 +1750,14 @@ final class CanvasLayout {
                         }
                         param.args[1] = ty;
                         layoutTy.put(param.thisObject, ty);
+                        // scale 和 guard 状态一起打：排查"替换应用后整体收缩再扩张"
+                        // 时缩小态(scale≈0.485)的 A2 到底是谁触发的、是否在替换窗口内。
+                        Long guard = replacingUntil.get(param.thisObject);
+                        boolean inGuard = guard != null && System.currentTimeMillis() < guard;
                         log("A2 align ty=" + Math.round(ty) + " drawn=" + Math.round(drawn)
-                                + " avail=" + Math.round(avail));
+                                + " avail=" + Math.round(avail)
+                                + " scale=" + String.format(java.util.Locale.US, "%.3f", scale)
+                                + " mode=" + mode + " guard=" + inGuard);
                     } catch (Throwable error) {
                         log("A2 align failed: " + error);
                     }
