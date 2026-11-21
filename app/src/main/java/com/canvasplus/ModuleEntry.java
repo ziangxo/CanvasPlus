@@ -34,6 +34,13 @@ public final class ModuleEntry implements IXposedHookLoadPackage {
             case "android":
                 FeatureUnlock.installSystem(param.classLoader);
                 Trigger.arm(param.classLoader);
+                // 2026-11-21：三屏启动闪屏。
+                // 去掉白色遮罩（CanvasSplash）单独用时白闪变黑闪；现配合"白板改黑色面板"
+                // 再试：遮罩退场露出的底色与黑色白板同色，视觉上掩盖那帧时序差。
+                // 白名单延迟移除（CanvasSplashFade）无效（缺 LIGHT_OS_ANIM_LEVEL 等条件），
+                // 仍停用。
+                CanvasSplash.installSystem(param.classLoader);
+                // CanvasSplashFade.installSystem(param.classLoader);
                 break;
 
             case "com.oplus.pscanvas":

@@ -38,8 +38,16 @@ $srcs = Get-ChildItem -Recurse app\src\main\java -Filter *.java | ForEach-Object
 if ($LASTEXITCODE -ne 0) { throw "javac failed $LASTEXITCODE" }
 
 Write-Host '== d8 =='
-$classes = Get-ChildItem -Recurse build\classes -Filter *.class | ForEach-Object { $_.FullName }
-& $d8 --release --min-api 35 --lib $platform --output build\dex @classes
+# 2026-11-21 坑：直接把 *.class 路径列表传给 d8，类一多（>20 个类）命令行就超长，
+# 报 "The input line is too long. The syntax of the command is incorrect." d8 failed 255。
+# 改成先用 jar 把 build\classes 打成一个 classes.jar，再把单个 jar 传给 d8。
+if (Test-Path build\classes.jar) { Remove-Item build\classes.jar -Force }
+Push-Location build\classes
+& $jar cf ..\classes.jar .
+Pop-Location
+if ($LASTEXITCODE -ne 0) { throw "jar classes failed $LASTEXITCODE" }
+if (-not (Test-Path build\dex)) { New-Item -ItemType Directory -Force -Path build\dex | Out-Null }
+& $d8 --release --min-api 35 --lib $platform --output build\dex build\classes.jar
 if ($LASTEXITCODE -ne 0) { throw "d8 failed $LASTEXITCODE" }
 
 Write-Host '== package =='
