@@ -88,7 +88,7 @@ public class ConfigActivity extends Activity {
     private static final String NO_CLICK_ZOOM_KEY = "canvasplus_no_click_zoom";
 
     /**
-     * 替换应用面板自动弹出的延迟（毫秒），范围 100~2000，默认 400。
+     * 替换应用面板自动弹出的延迟（毫秒），范围 10~1000，默认 400。
      *
      * 为什么做成可配置：AutoReplace 里原本写死 N2_DELAY=400ms，用户反馈有的场景
      * 面板弹得太早（三窗动画还没落地）有的太晚，需要自己按机器手感调。
@@ -97,9 +97,25 @@ public class ConfigActivity extends Activity {
      * 只能走 Global。
      */
     private static final String PANEL_DELAY_KEY = "canvasplus_panel_delay";
-    private static final int PANEL_DELAY_MIN = 100;
-    private static final int PANEL_DELAY_MAX = 2000;
+    private static final int PANEL_DELAY_MIN = 10;
+    private static final int PANEL_DELAY_MAX = 1000;
     private static final int PANEL_DELAY_DEFAULT = 400;
+
+    /**
+     * 配置备份/还原（2026-11-21 用户要求，放在「命令」弹窗底部，不占应用列表面积）。
+     *
+     * 快照 = 4 个 Settings.Global key 的合成 JSON：
+     *   {"cfg":{"hidden":[...],"order":[...]}, "focus":"-1", "zoom":"1", "delay":"400"}
+     * 备份/还原存 App 私有 SharedPreferences 的单槽位（文件名 canvasplus_backup，
+     * key snapshot）；导出/导入走剪贴板（只读写字符串，不需要存储权限）。
+     *
+     * 为什么不写进 Settings.Global 的一个新 key：那是全局可读的，任何 App 都能
+     * 篡改我们的备份；私有 SP 只有本 App 能碰，作为"本地槽位"最合适。
+     * 为什么快照把 4 个 key 合成一个 JSON：导出/导入剪贴板只有一条字符串，
+     * 拆成 4 段用户没法可靠粘贴；一个 JSON 既能进 SP 也能进剪贴板，两条路径复用。
+     */
+    private static final String BACKUP_SP = "canvasplus_backup";
+    private static final String BACKUP_KEY = "snapshot";
 
     /** 当前选中的焦点目标（-1 = 不干预，保持画布默认）。 */
     private int focusSel = -1;
@@ -351,7 +367,7 @@ public class ConfigActivity extends Activity {
      * 替换应用面板自动弹出延迟的滑块行（2026-11-21 用户要求）。
      *
      * 为什么用 framework SeekBar 而不是 androidx:本项目零 androidx 依赖（见类注释）。
-     * SeekBar 的 progress 直接存"毫秒减下限"（0..1900），读时加回 100，
+     * SeekBar 的 progress 直接存"毫秒减下限"（0..990），读时加回 10，
      * 这样滑块位置和真实毫秒一一对应，不需要再乘系数。
      */
     private void addPanelDelayRow(LinearLayout root) {
@@ -434,6 +450,46 @@ public class ConfigActivity extends Activity {
         addCommandRow(box, "加应用到画布", ShortcutActivity.CMD_ADD);
         addCommandRow(box, "切换三窗布局方向", ShortcutActivity.CMD_LAYOUT);
 
+        // 配置备份/还原/导出/导入（2026-11-21）：放在弹窗最底部ScrollView里，
+        // 不占主页面应用列表的任何高度。四个按钮一行放不下，分两行。
+        TextView cfgTitle = new TextView(this);
+        cfgTitle.setText("配置备份 / 还原（隐藏+排序+焦点+开关+延迟）");
+        cfgTitle.setTextSize(12);
+        cfgTitle.setPadding(0, dp(10), 0, dp(2));
+        box.addView(cfgTitle);
+
+        LinearLayout cfgRow1 = new LinearLayout(this);
+        cfgRow1.setOrientation(LinearLayout.HORIZONTAL);
+        Button backupBtn = new Button(this);
+        backupBtn.setText("备份");
+        backupBtn.setTextSize(12);
+        backupBtn.setOnClickListener(v -> backupLocal());
+        Button restoreBtn = new Button(this);
+        restoreBtn.setText("还原");
+        restoreBtn.setTextSize(12);
+        restoreBtn.setOnClickListener(v -> restoreLocal());
+        cfgRow1.addView(backupBtn, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        cfgRow1.addView(restoreBtn, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        box.addView(cfgRow1);
+
+        LinearLayout cfgRow2 = new LinearLayout(this);
+        cfgRow2.setOrientation(LinearLayout.HORIZONTAL);
+        Button exportBtn = new Button(this);
+        exportBtn.setText("导出");
+        exportBtn.setTextSize(12);
+        exportBtn.setOnClickListener(v -> exportClipboard());
+        Button importBtn = new Button(this);
+        importBtn.setText("导入");
+        importBtn.setTextSize(12);
+        importBtn.setOnClickListener(v -> importClipboard());
+        cfgRow2.addView(exportBtn, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        cfgRow2.addView(importBtn, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        box.addView(cfgRow2);
+
         ScrollView scroll = new ScrollView(this);
         scroll.addView(box);
         new AlertDialog.Builder(this)
@@ -481,6 +537,162 @@ public class ConfigActivity extends Activity {
             toast("已复制：" + command);
         } catch (Throwable t) {
             toast("复制失败：" + t);
+        }
+    }
+
+    // ---------------- 配置备份 / 还原 / 导出 / 导入 ----------------
+
+    /**
+     * 把当前 4 个 Settings.Global key 打包成一个快照 JSON。
+     *
+     * cfg 直接取落盘的原始 JSON（不是从 items 重建）：这样备份的是"当前真正生效的
+     * 配置"，而不是页面上还没保存的临时改动。缺项用默认值补齐，保证快照自包含。
+     */
+    private JSONObject snapshotConfig() {
+        JSONObject snap = new JSONObject();
+        try {
+            String cfgRaw = readCfg();
+            JSONObject cfg = (cfgRaw != null && !cfgRaw.isEmpty())
+                    ? new JSONObject(cfgRaw) : new JSONObject();
+            if (!cfg.has("hidden")) cfg.put("hidden", new JSONArray());
+            if (!cfg.has("order")) cfg.put("order", new JSONArray());
+            snap.put("cfg", cfg);
+            snap.put("focus", globalOr(FOCUS_KEY, "-1"));
+            snap.put("zoom", globalOr(NO_CLICK_ZOOM_KEY, "1"));
+            snap.put("delay", globalOr(PANEL_DELAY_KEY, String.valueOf(PANEL_DELAY_DEFAULT)));
+            snap.put("v", 1);
+        } catch (Throwable ignored) {
+        }
+        return snap;
+    }
+
+    /** 读一个 Global 字符串，读不到返回兜底值。 */
+    private String globalOr(String key, String fallback) {
+        try {
+            String v = Settings.Global.getString(getContentResolver(), key);
+            return (v == null || v.isEmpty()) ? fallback : v;
+        } catch (Throwable t) {
+            return fallback;
+        }
+    }
+
+    /** 备份到 App 私有 SP 单槽位。 */
+    private void backupLocal() {
+        try {
+            String json = snapshotConfig().toString();
+            getSharedPreferences(BACKUP_SP, MODE_PRIVATE).edit()
+                    .putString(BACKUP_KEY, json).apply();
+            toast("已备份到本机（隐藏/排序/焦点/开关/延迟）");
+        } catch (Throwable t) {
+            toast("备份失败：" + t);
+        }
+    }
+
+    /** 从 App 私有 SP 还原；没备份过不写任何东西。 */
+    private void restoreLocal() {
+        String json = getSharedPreferences(BACKUP_SP, MODE_PRIVATE)
+                .getString(BACKUP_KEY, null);
+        if (json == null || json.isEmpty()) {
+            toast("本机还没有备份");
+            return;
+        }
+        applySnapshot(json, "还原");
+    }
+
+    /** 导出快照到剪贴板。 */
+    private void exportClipboard() {
+        try {
+            String json = snapshotConfig().toString();
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null) {
+                toast("导出失败：剪贴板不可用");
+                return;
+            }
+            cm.setPrimaryClip(ClipData.newPlainText("CanvasPlus 配置", json));
+            toast("已导出到剪贴板（" + json.length() + " 字符）");
+        } catch (Throwable t) {
+            toast("导出失败：" + t);
+        }
+    }
+
+    /** 从剪贴板导入快照。 */
+    private void importClipboard() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || cm.getPrimaryClip() == null
+                    || cm.getPrimaryClip().getItemCount() == 0) {
+                toast("剪贴板里没有内容");
+                return;
+            }
+            CharSequence text = cm.getPrimaryClip().getItemAt(0).getText();
+            if (text == null || text.toString().trim().isEmpty()) {
+                toast("剪贴板里不是文本");
+                return;
+            }
+            applySnapshot(text.toString().trim(), "导入");
+        } catch (Throwable t) {
+            toast("导入失败：" + t);
+        }
+    }
+
+    /**
+     * 把快照 JSON 写回 4 个 key。直写优先，cfg 写失败时走 Trigger 广播降级；
+     * 焦点/开关/延迟也一并塞进广播（Trigger 已支持这三个 extra）。
+     * 写完重建界面，让列表排序/勾选/滑块反映新配置。
+     */
+    private void applySnapshot(String json, String what) {
+        try {
+            JSONObject snap = new JSONObject(json);
+            JSONObject cfg = snap.optJSONObject("cfg");
+            if (cfg == null || !cfg.has("hidden") || !cfg.has("order")) {
+                toast(what + "失败：配置格式不对（缺少 cfg.hidden/order）");
+                return;
+            }
+            String focus = String.valueOf(snap.optInt("focus", -1));
+            String zoom = String.valueOf(snap.optInt("zoom", 1));
+            int delay = snap.optInt("delay", PANEL_DELAY_DEFAULT);
+            if (delay < PANEL_DELAY_MIN || delay > PANEL_DELAY_MAX) delay = PANEL_DELAY_DEFAULT;
+            String delayStr = String.valueOf(delay);
+            final String raw = cfg.toString();
+
+            boolean focusOk = putGlobal(FOCUS_KEY, focus);
+            boolean zoomOk = putGlobal(NO_CLICK_ZOOM_KEY, zoom);
+            boolean delayOk = putGlobal(PANEL_DELAY_KEY, delayStr);
+
+            if (writeGlobal(raw)) {
+                toast(what + "成功（隐藏/排序/焦点/开关/延迟）"
+                        + ((focusOk && zoomOk && delayOk) ? "" : "（部分附加项没写进去）"));
+                recreate();
+                return;
+            }
+
+            // cfg 直写失败 → 广播给 system_server 的 Trigger 代写，附加项也一起带。
+            sendBroadcast(new Intent(ACTION_SET_CFG)
+                    .setPackage("android")
+                    .putExtra("json", raw)
+                    .putExtra("no_click_zoom", zoom)
+                    .putExtra("panel_delay", delay)
+                    .putExtra("focus", focus));
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                if (raw.equals(readCfg())) {
+                    toast(what + "成功");
+                    recreate();
+                } else {
+                    toast(what + "没写进去：请 adb shell pm grant com.canvasplus "
+                            + "android.permission.WRITE_SECURE_SETTINGS");
+                }
+            }, 800L);
+        } catch (Throwable t) {
+            toast(what + "失败：" + t);
+        }
+    }
+
+    /** 直写一个 Global 字符串，返回是否成功（不抛异常）。 */
+    private boolean putGlobal(String key, String value) {
+        try {
+            return Settings.Global.putString(getContentResolver(), key, value);
+        } catch (Throwable t) {
+            return false;
         }
     }
 

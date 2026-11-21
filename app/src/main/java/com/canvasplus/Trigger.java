@@ -177,7 +177,7 @@ final class Trigger {
                         }
                         // 面板弹出延迟：没 grant 写权限时由这里代写，key 与 AutoReplace 一致。
                         int delay = intent.getIntExtra("panel_delay", -1);
-                        if (delay >= 100 && delay <= 2000) {
+                        if (delay >= 10 && delay <= 1000) {
                             try {
                                 android.provider.Settings.Global.putString(
                                         context.getContentResolver(),
@@ -185,6 +185,21 @@ final class Trigger {
                                 log("panel delay updated: " + delay);
                             } catch (Throwable error) {
                                 log("panel delay failed: " + error);
+                            }
+                        }
+                        // 焦点配置：备份还原/无权限保存时由这里代写（key 与 AutoReplace 一致）。
+                        String focus = intent.getStringExtra("focus");
+                        if (focus != null) {
+                            try {
+                                int f = Integer.parseInt(focus.trim());
+                                if (f >= -1 && f <= 2) {
+                                    android.provider.Settings.Global.putString(
+                                            context.getContentResolver(),
+                                            "canvasplus_triple_focus", focus.trim());
+                                    log("focus updated: " + focus);
+                                }
+                            } catch (Throwable error) {
+                                log("focus failed: " + error);
                             }
                         }
                         return;

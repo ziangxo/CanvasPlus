@@ -51,7 +51,7 @@ final class AutoReplace {
     /**
      * N2 触发后第一次检查窗口数的默认延迟（2026-11-20 定 400ms）。
      * 2026-11-21 起可由用户在配置页滑块改（Settings.Global "canvasplus_panel_delay"，
-     * 100~2000ms），用 panelDelay() 读；这个默认值只在读不到配置时兜底。
+     * 10~1000ms），用 panelDelay() 读；这个默认值只在读不到配置时兜底。
      * 命中三窗就立刻弹面板，不再额外加延迟；没到三窗则按 RETRY_DELAY 继续重试。
      */
     private static final long N2_DELAY_DEFAULT = 400L;
@@ -453,7 +453,7 @@ final class AutoReplace {
     // ---------------- 替换面板弹出延迟（可配置） ----------------
 
     /**
-     * 替换应用面板弹出延迟，读 Settings.Global "canvasplus_panel_delay"（100~2000ms）。
+     * 替换应用面板弹出延迟，读 Settings.Global "canvasplus_panel_delay"（10~1000ms）。
      *
      * 与 focus 用同一套 TTL 缓存：拖完滑块 → 保存 → 下次触发三分屏读到的就是新值，
      * 不用重启 pscanvas 进程。缓存 1 秒，避免每次 N2 都跨进程读 Settings。
@@ -465,7 +465,7 @@ final class AutoReplace {
 
     private static long panelDelay() {
         long now = System.currentTimeMillis();
-        if (panelDelayCfg >= 100 && now - panelDelayCfgAt < 1000L) return panelDelayCfg;
+        if (panelDelayCfg >= 10 && now - panelDelayCfgAt < 1000L) return panelDelayCfg;
         int value = (int) N2_DELAY_DEFAULT;
         try {
             android.content.Context ctx = appContext();
@@ -474,7 +474,7 @@ final class AutoReplace {
                         ctx.getContentResolver(), PANEL_DELAY_KEY);
                 if (raw != null && !raw.isEmpty()) {
                     int parsed = Integer.parseInt(raw.trim());
-                    if (parsed >= 100 && parsed <= 2000) value = parsed;
+                    if (parsed >= 10 && parsed <= 1000) value = parsed;
                 }
             }
         } catch (Throwable t) {
