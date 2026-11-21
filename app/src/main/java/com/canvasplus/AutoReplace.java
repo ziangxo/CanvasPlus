@@ -49,10 +49,12 @@ final class AutoReplace {
     private static final String ADAPTER = "u1.c";
 
     /**
-     * N2 触发后第一次检查窗口数的延迟（2026-11-20 用户定为 400ms）。
+     * N2 触发后第一次检查窗口数的默认延迟（2026-11-20 定 400ms）。
+     * 2026-11-21 起可由用户在配置页滑块改（Settings.Global "canvasplus_panel_delay"，
+     * 100~2000ms），用 panelDelay() 读；这个默认值只在读不到配置时兜底。
      * 命中三窗就立刻弹面板，不再额外加延迟；没到三窗则按 RETRY_DELAY 继续重试。
      */
-    private static final long N2_DELAY = 400L;
+    private static final long N2_DELAY_DEFAULT = 400L;
     /**
      * 用户点击窗口（T(450,animate)）后弹面板的延迟。
      * 原本 550 是等 450ms 焦点动画播完；现在缩到 200，面板在动画收尾时就出来，
@@ -95,7 +97,8 @@ final class AutoReplace {
             // 三窗/四窗布局完成。四窗时 count==4 不处理；三窗延迟确认。
             XposedBridge.hookAllMethods(view, "N2", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
-                    checkLater(param.thisObject, N2_DELAY, 0);
+                    // 延迟每次读配置（带 TTL 缓存），用户拖完滑块不用重启进程即可生效。
+                    checkLater(param.thisObject, panelDelay(), 0);
                 }
             });
 
@@ -445,6 +448,41 @@ final class AutoReplace {
         } catch (Throwable t) {
             return -1;
         }
+    }
+
+    // ---------------- 替换面板弹出延迟（可配置） ----------------
+
+    /**
+     * 替换应用面板弹出延迟，读 Settings.Global "canvasplus_panel_delay"（100~2000ms）。
+     *
+     * 与 focus 用同一套 TTL 缓存：拖完滑块 → 保存 → 下次触发三分屏读到的就是新值，
+     * 不用重启 pscanvas 进程。缓存 1 秒，避免每次 N2 都跨进程读 Settings。
+     * 越界 / 坏值一律退回 400ms，和用户配置页的默认值一致。
+     */
+    private static final String PANEL_DELAY_KEY = "canvasplus_panel_delay";
+    private static volatile int panelDelayCfg = -1;
+    private static volatile long panelDelayCfgAt = 0L;
+
+    private static long panelDelay() {
+        long now = System.currentTimeMillis();
+        if (panelDelayCfg >= 100 && now - panelDelayCfgAt < 1000L) return panelDelayCfg;
+        int value = (int) N2_DELAY_DEFAULT;
+        try {
+            android.content.Context ctx = appContext();
+            if (ctx != null) {
+                String raw = android.provider.Settings.Global.getString(
+                        ctx.getContentResolver(), PANEL_DELAY_KEY);
+                if (raw != null && !raw.isEmpty()) {
+                    int parsed = Integer.parseInt(raw.trim());
+                    if (parsed >= 100 && parsed <= 2000) value = parsed;
+                }
+            }
+        } catch (Throwable t) {
+            log("panel delay cfg read failed: " + t);
+        }
+        panelDelayCfg = value;
+        panelDelayCfgAt = now;
+        return value;
     }
 
     // ---------------- 三分屏启动后的焦点 ----------------

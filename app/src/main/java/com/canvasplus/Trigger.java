@@ -175,6 +175,18 @@ final class Trigger {
                                 log("no click zoom failed: " + error);
                             }
                         }
+                        // 面板弹出延迟：没 grant 写权限时由这里代写，key 与 AutoReplace 一致。
+                        int delay = intent.getIntExtra("panel_delay", -1);
+                        if (delay >= 100 && delay <= 2000) {
+                            try {
+                                android.provider.Settings.Global.putString(
+                                        context.getContentResolver(),
+                                        "canvasplus_panel_delay", String.valueOf(delay));
+                                log("panel delay updated: " + delay);
+                            } catch (Throwable error) {
+                                log("panel delay failed: " + error);
+                            }
+                        }
                         return;
                     }
                     if (ACTION_ADD.equals(intent.getAction())) {

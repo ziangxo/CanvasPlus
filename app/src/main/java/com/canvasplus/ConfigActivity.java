@@ -87,10 +87,26 @@ public class ConfigActivity extends Activity {
      */
     private static final String NO_CLICK_ZOOM_KEY = "canvasplus_no_click_zoom";
 
+    /**
+     * 替换应用面板自动弹出的延迟（毫秒），范围 100~2000，默认 400。
+     *
+     * 为什么做成可配置：AutoReplace 里原本写死 N2_DELAY=400ms，用户反馈有的场景
+     * 面板弹得太早（三窗动画还没落地）有的太晚，需要自己按机器手感调。
+     * 为什么存 Settings.Global 而不是 App 私有 SP：读它的 AutoReplace 跑在
+     * pscanvas 进程（不同 UID），读不到本 App 的 SP，和 hidden/order/focus 一样
+     * 只能走 Global。
+     */
+    private static final String PANEL_DELAY_KEY = "canvasplus_panel_delay";
+    private static final int PANEL_DELAY_MIN = 100;
+    private static final int PANEL_DELAY_MAX = 2000;
+    private static final int PANEL_DELAY_DEFAULT = 400;
+
     /** 当前选中的焦点目标（-1 = 不干预，保持画布默认）。 */
     private int focusSel = -1;
     /** 缩小后点击窗口是否还放大（true = 不放大，只切焦点）。 */
     private boolean noClickZoom = true;
+    /** 替换应用面板自动弹出延迟（毫秒）。 */
+    private int panelDelay = PANEL_DELAY_DEFAULT;
 
     /** 一行 = 一个可被替换的应用。 */
     private static final class Item {
@@ -112,6 +128,7 @@ public class ConfigActivity extends Activity {
         super.onCreate(savedInstanceState);
         loadFocus();
         loadNoClickZoom();
+        loadPanelDelay();
         buildUi();
         loadApps();
     }
@@ -161,6 +178,21 @@ public class ConfigActivity extends Activity {
         bar.addView(save);
         root.addView(bar);
 
+        addFocusRow(root);
+        addNoClickZoomRow(root);
+        addPanelDelayRow(root);
+
+        // 说明文字压到两行：之前那段长文案 + 命令清单把 ListView 挤成一条缝（用户反馈过）
+        TextView hint = new TextView(this);
+        hint.setText("勾选 = 在面板「全部应用」里隐藏，↑↓ 调顺序；改完点保存。"
+                + "shell 命令在右上角「命令」里，可复制。");
+        hint.setTextSize(12);
+        hint.setPadding(0, dp(4), 0, dp(4));
+        root.addView(hint);
+
+        // 搜索框紧贴应用列表上方（2026-11-21 用户要求）：原先放在标题栏下面、
+        // 和焦点行/开关挤在面板顶部，用户觉得不妥。搜索只作用于下面的应用列表，
+        // 放到列表正上方所见即所得，顶部区域也留给全局设置项。
         EditText search = new EditText(this);
         search.setHint("搜索应用名或包名");
         search.setSingleLine(true);
@@ -174,17 +206,6 @@ public class ConfigActivity extends Activity {
         });
         root.addView(search, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        addFocusRow(root);
-        addNoClickZoomRow(root);
-
-        // 说明文字压到两行：之前那段长文案 + 命令清单把 ListView 挤成一条缝（用户反馈过）
-        TextView hint = new TextView(this);
-        hint.setText("勾选 = 在面板「全部应用」里隐藏，↑↓ 调顺序；改完点保存。"
-                + "shell 命令在右上角「命令」里，可复制。");
-        hint.setTextSize(12);
-        hint.setPadding(0, dp(4), 0, dp(4));
-        root.addView(hint);
 
         ListView list = new ListView(this);
         adapter = new ArrayAdapter<Item>(this, 0, shown) {
@@ -210,23 +231,60 @@ public class ConfigActivity extends Activity {
                 hide.setOnCheckedChangeListener((b, checked) -> item.hidden = checked);
                 row.addView(hide);
 
+                // 应用名和包名拆成两个 TextView（2026-11-21 用户要求「包名另起一行，
+                // 以免排版拥挤」）。原先一个 TextView 里 label+"\n"+pkg，长包名会折成
+                // 两三行、把 ↑↓ 按钮顶得很挤；拆开后包名单独一行、小字灰色，一行高度
+                // 稳定，4 个按钮也不会被挤走。
                 TextView label = new TextView(ConfigActivity.this);
-                label.setText(item.label + "\n" + item.pkg);
+                label.setText(item.label);
                 label.setTextSize(13);
                 label.setPadding(dp(8), 0, dp(8), 0);
-                row.addView(label, new LinearLayout.LayoutParams(0,
+                LinearLayout textCol = new LinearLayout(ConfigActivity.this);
+                textCol.setOrientation(LinearLayout.VERTICAL);
+                textCol.addView(label);
+                TextView pkgView = new TextView(ConfigActivity.this);
+                pkgView.setText(item.pkg);
+                pkgView.setTextSize(10);
+                pkgView.setTextColor(0xFF888888);
+                pkgView.setPadding(dp(8), 0, dp(8), 0);
+                textCol.addView(pkgView);
+                row.addView(textCol, new LinearLayout.LayoutParams(0,
                         ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-                // 上下箭头：不用拖动，避免 androidx 依赖
+                // 排序按钮：↑↓ 相邻移动，顶/底 一键移到两端（2026-11-21 用户要求）。
+                // 不用拖动，避免 androidx 依赖；四个按钮最小宽度收窄到 40dp，
+                // 配合包名另起一行后一行放得下。
+                Button top = new Button(ConfigActivity.this);
+                top.setText("顶");
+                top.setTextSize(12);
+                top.setMinWidth(dp(40));
+                top.setMinimumWidth(0);
+                top.setPadding(dp(4), dp(2), dp(4), dp(2));
+                top.setOnClickListener(v -> moveToEdge(position, true));
+                row.addView(top);
+
+                Button bottom = new Button(ConfigActivity.this);
+                bottom.setText("底");
+                bottom.setTextSize(12);
+                bottom.setMinWidth(dp(40));
+                bottom.setMinimumWidth(0);
+                bottom.setPadding(dp(4), dp(2), dp(4), dp(2));
+                bottom.setOnClickListener(v -> moveToEdge(position, false));
+                row.addView(bottom);
+
                 Button up = new Button(ConfigActivity.this);
                 up.setText("↑");
-                up.setMinWidth(dp(44));
+                up.setMinWidth(dp(40));
+                up.setMinimumWidth(0);
+                up.setPadding(dp(4), dp(2), dp(4), dp(2));
                 up.setOnClickListener(v -> move(position, -1));
                 row.addView(up);
 
                 Button down = new Button(ConfigActivity.this);
                 down.setText("↓");
-                down.setMinWidth(dp(44));
+                down.setMinWidth(dp(40));
+                down.setMinimumWidth(0);
+                down.setPadding(dp(4), dp(2), dp(4), dp(2));
                 down.setOnClickListener(v -> move(position, 1));
                 row.addView(down);
 
@@ -287,6 +345,60 @@ public class ConfigActivity extends Activity {
         box.setChecked(noClickZoom);
         box.setOnCheckedChangeListener((b, checked) -> noClickZoom = checked);
         root.addView(box);
+    }
+
+    /**
+     * 替换应用面板自动弹出延迟的滑块行（2026-11-21 用户要求）。
+     *
+     * 为什么用 framework SeekBar 而不是 androidx:本项目零 androidx 依赖（见类注释）。
+     * SeekBar 的 progress 直接存"毫秒减下限"（0..1900），读时加回 100，
+     * 这样滑块位置和真实毫秒一一对应，不需要再乘系数。
+     */
+    private void addPanelDelayRow(LinearLayout root) {
+        TextView label = new TextView(this);
+        label.setText("替换应用面板弹出延迟");
+        label.setTextSize(13);
+        label.setPadding(0, dp(8), 0, dp(2));
+        root.addView(label);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        final TextView value = new TextView(this);
+        value.setText(panelDelay + " ms");
+        value.setTextSize(12);
+        value.setMinWidth(dp(64));
+
+        android.widget.SeekBar seek = new android.widget.SeekBar(this);
+        seek.setMax(PANEL_DELAY_MAX - PANEL_DELAY_MIN);
+        seek.setProgress(panelDelay - PANEL_DELAY_MIN);
+        seek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(android.widget.SeekBar s, int p, boolean fromUser) {
+                if (fromUser) {
+                    panelDelay = PANEL_DELAY_MIN + p;
+                    value.setText(panelDelay + " ms");
+                }
+            }
+            @Override public void onStartTrackingTouch(android.widget.SeekBar s) { }
+            @Override public void onStopTrackingTouch(android.widget.SeekBar s) { }
+        });
+        row.addView(value);
+        row.addView(seek, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(row);
+    }
+
+    /** 读面板延迟；没写过 / 坏值 / 越界一律退回默认 400ms。 */
+    private void loadPanelDelay() {
+        try {
+            String raw = Settings.Global.getString(getContentResolver(), PANEL_DELAY_KEY);
+            if (raw == null || raw.isEmpty()) return;
+            int value = Integer.parseInt(raw.trim());
+            if (value >= PANEL_DELAY_MIN && value <= PANEL_DELAY_MAX) panelDelay = value;
+        } catch (Throwable ignored) {
+            // 读不到 / 格式坏：保持默认
+        }
     }
 
     /**
@@ -433,6 +545,24 @@ public class ConfigActivity extends Activity {
         applyFilter();
     }
 
+    /**
+     * 把第 position 个可见行移到全量列表的最前（top=true）或最后（top=false）。
+     *
+     * 和 move() 同一个坑：必须改 items（全量）而不是 shown（搜索后的子集），
+     * 否则搜索过滤时移到"顶"只在可见子集里生效，清掉搜索词后顺序又乱。
+     * 搜索状态下移到顶/底是"在所有应用里置顶/置底"，这样语义才稳定。
+     */
+    private void moveToEdge(int position, boolean top) {
+        if (position < 0 || position >= shown.size()) return;
+        Item item = shown.get(position);
+        int from = items.indexOf(item);
+        if (from < 0) return;
+        items.remove(from);
+        if (top) items.add(0, item);
+        else items.add(item);
+        applyFilter();
+    }
+
     /** 按 query 重建 shown（保持 items 的顺序），再刷列表。 */
     private void applyFilter() {
         shown.clear();
@@ -528,12 +658,21 @@ public class ConfigActivity extends Activity {
             } catch (Throwable ignored) {
                 // 没权限：下面的 toast 会提示
             }
+            // 面板延迟同理，单独一个 key（AutoReplace 读它，与面板配置 JSON 无关）
+            boolean delayOk = false;
+            try {
+                delayOk = Settings.Global.putString(
+                        getContentResolver(), PANEL_DELAY_KEY, String.valueOf(panelDelay));
+            } catch (Throwable ignored) {
+                // 没权限：下面的 toast 会提示
+            }
 
             if (writeGlobal(raw)) {
                 toast("已保存：" + hidden.length() + " 个隐藏，共 " + order.length() + " 个应用，"
-                        + "焦点=" + focusLabel()
+                        + "焦点=" + focusLabel() + "，延迟=" + panelDelay + "ms"
                         + (focusOk ? "" : "（焦点项没写进去）")
-                        + (zoomOk ? "" : "（点击放大开关没写进去）"));
+                        + (zoomOk ? "" : "（点击放大开关没写进去）")
+                        + (delayOk ? "" : "（延迟项没写进去）"));
                 finish();
                 return;
             }
@@ -544,7 +683,8 @@ public class ConfigActivity extends Activity {
             sendBroadcast(new Intent(ACTION_SET_CFG)
                     .setPackage("android")
                     .putExtra("json", raw)
-                    .putExtra("no_click_zoom", zoomValue));
+                    .putExtra("no_click_zoom", zoomValue)
+                    .putExtra("panel_delay", panelDelay));
             // 广播是异步的，等一小会儿回读，给用户真实结果，不要假装成功。
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 if (raw.equals(readCfg())) {
