@@ -187,6 +187,19 @@ final class Trigger {
                                 log("panel delay failed: " + error);
                             }
                         }
+                        // 三窗间隔：无权限保存/还原时由这里代写（key 与 CanvasLayout 一致）。
+                        // 2026-11-22 新增，范围 0~20dp。
+                        int gap = intent.getIntExtra("triple_gap", -1);
+                        if (gap >= 0 && gap <= 20) {
+                            try {
+                                android.provider.Settings.Global.putString(
+                                        context.getContentResolver(),
+                                        "canvasplus_triple_gap", String.valueOf(gap));
+                                log("triple gap updated: " + gap);
+                            } catch (Throwable error) {
+                                log("triple gap failed: " + error);
+                            }
+                        }
                         // 焦点配置：备份还原/无权限保存时由这里代写（key 与 AutoReplace 一致）。
                         String focus = intent.getStringExtra("focus");
                         if (focus != null) {

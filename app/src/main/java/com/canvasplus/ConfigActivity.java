@@ -102,10 +102,21 @@ public class ConfigActivity extends Activity {
     private static final int PANEL_DELAY_DEFAULT = 400;
 
     /**
+     * 三窗之间的间隔（单位 dp），与 CanvasLayout.TRIPLE_GAP_KEY 保持一致。
+     * 官方 B1.l.e1/Y0 写死 10dp（本机≈35px），这里让用户用滑块缩小/放大，
+     * 范围 0~20dp、默认 4dp。0 = 窗口紧贴无黑边。存 Global 的原因同 panel_delay：
+     * 消费方 CanvasLayout 跑在 pscanvas 进程，读不到本 App 私有 SP。
+     */
+    private static final String TRIPLE_GAP_KEY = "canvasplus_triple_gap";
+    private static final int TRIPLE_GAP_MIN = 0;
+    private static final int TRIPLE_GAP_MAX = 20;
+    private static final int TRIPLE_GAP_DEFAULT = 4;
+
+    /**
      * 配置备份/还原（2026-11-21 用户要求，放在「命令」弹窗底部，不占应用列表面积）。
      *
-     * 快照 = 4 个 Settings.Global key 的合成 JSON：
-     *   {"cfg":{"hidden":[...],"order":[...]}, "focus":"-1", "zoom":"1", "delay":"400"}
+     * 快照 = 5 个 Settings.Global key 的合成 JSON（2026-11-22 加 gap，格式 v2）：
+     *   {"cfg":{"hidden":[...],"order":[...]}, "focus":"-1", "zoom":"1", "delay":"400", "gap":"4"}
      * 备份/还原存 App 私有 SharedPreferences 的单槽位（文件名 canvasplus_backup，
      * key snapshot）；导出/导入走剪贴板（只读写字符串，不需要存储权限）。
      *
@@ -123,6 +134,8 @@ public class ConfigActivity extends Activity {
     private boolean noClickZoom = true;
     /** 替换应用面板自动弹出延迟（毫秒）。 */
     private int panelDelay = PANEL_DELAY_DEFAULT;
+    /** 三窗间隔（dp）。 */
+    private int tripleGap = TRIPLE_GAP_DEFAULT;
 
     /** 一行 = 一个可被替换的应用。 */
     private static final class Item {
@@ -145,6 +158,7 @@ public class ConfigActivity extends Activity {
         loadFocus();
         loadNoClickZoom();
         loadPanelDelay();
+        loadTripleGap();
         buildUi();
         loadApps();
     }
@@ -197,6 +211,7 @@ public class ConfigActivity extends Activity {
         addFocusRow(root);
         addNoClickZoomRow(root);
         addPanelDelayRow(root);
+        addTripleGapRow(root);
 
         // 说明文字压到两行：之前那段长文案 + 命令清单把 ListView 挤成一条缝（用户反馈过）
         TextView hint = new TextView(this);
@@ -417,6 +432,53 @@ public class ConfigActivity extends Activity {
         }
     }
 
+    /** 三窗间隔滑块行（2026-11-22 用户要求）。0dp=窗口紧贴，官方默认 10dp。 */
+    private void addTripleGapRow(LinearLayout root) {
+        TextView label = new TextView(this);
+        label.setText("三屏窗口间隔（0 = 无黑边）");
+        label.setTextSize(13);
+        label.setPadding(0, dp(8), 0, dp(2));
+        root.addView(label);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        final TextView value = new TextView(this);
+        value.setText(tripleGap + " dp");
+        value.setTextSize(12);
+        value.setMinWidth(dp(64));
+
+        android.widget.SeekBar seek = new android.widget.SeekBar(this);
+        seek.setMax(TRIPLE_GAP_MAX - TRIPLE_GAP_MIN);
+        seek.setProgress(tripleGap - TRIPLE_GAP_MIN);
+        seek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(android.widget.SeekBar s, int p, boolean fromUser) {
+                if (fromUser) {
+                    tripleGap = TRIPLE_GAP_MIN + p;
+                    value.setText(tripleGap + " dp");
+                }
+            }
+            @Override public void onStartTrackingTouch(android.widget.SeekBar s) { }
+            @Override public void onStopTrackingTouch(android.widget.SeekBar s) { }
+        });
+        row.addView(value);
+        row.addView(seek, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(row);
+    }
+
+    /** 读三窗间隔；没写过 / 坏值 / 越界一律退回默认 4dp。 */
+    private void loadTripleGap() {
+        try {
+            String raw = Settings.Global.getString(getContentResolver(), TRIPLE_GAP_KEY);
+            if (raw == null || raw.isEmpty()) return;
+            int value = Integer.parseInt(raw.trim());
+            if (value >= TRIPLE_GAP_MIN && value <= TRIPLE_GAP_MAX) tripleGap = value;
+        } catch (Throwable ignored) {
+        }
+    }
+
     /**
      * 可调用的 shell 命令清单（2026-11-21 用户要求：菜单里声明可调用的命令，并能复制）。
      *
@@ -560,7 +622,10 @@ public class ConfigActivity extends Activity {
             snap.put("focus", globalOr(FOCUS_KEY, "-1"));
             snap.put("zoom", globalOr(NO_CLICK_ZOOM_KEY, "1"));
             snap.put("delay", globalOr(PANEL_DELAY_KEY, String.valueOf(PANEL_DELAY_DEFAULT)));
-            snap.put("v", 1);
+            // 2026-11-22：新增三窗间隔，快照格式升 v2；旧快照没有 gap 字段，
+            // applySnapshot 用 optInt 兜底默认值，兼容还原老备份。
+            snap.put("gap", globalOr(TRIPLE_GAP_KEY, String.valueOf(TRIPLE_GAP_DEFAULT)));
+            snap.put("v", 2);
         } catch (Throwable ignored) {
         }
         return snap;
@@ -653,15 +718,18 @@ public class ConfigActivity extends Activity {
             int delay = snap.optInt("delay", PANEL_DELAY_DEFAULT);
             if (delay < PANEL_DELAY_MIN || delay > PANEL_DELAY_MAX) delay = PANEL_DELAY_DEFAULT;
             String delayStr = String.valueOf(delay);
+            int gap = snap.optInt("gap", TRIPLE_GAP_DEFAULT);
+            if (gap < TRIPLE_GAP_MIN || gap > TRIPLE_GAP_MAX) gap = TRIPLE_GAP_DEFAULT;
             final String raw = cfg.toString();
 
             boolean focusOk = putGlobal(FOCUS_KEY, focus);
             boolean zoomOk = putGlobal(NO_CLICK_ZOOM_KEY, zoom);
             boolean delayOk = putGlobal(PANEL_DELAY_KEY, delayStr);
+            boolean gapOk = putGlobal(TRIPLE_GAP_KEY, String.valueOf(gap));
 
             if (writeGlobal(raw)) {
-                toast(what + "成功（隐藏/排序/焦点/开关/延迟）"
-                        + ((focusOk && zoomOk && delayOk) ? "" : "（部分附加项没写进去）"));
+                toast(what + "成功（隐藏/排序/焦点/开关/延迟/间隔）"
+                        + ((focusOk && zoomOk && delayOk && gapOk) ? "" : "（部分附加项没写进去）"));
                 recreate();
                 return;
             }
@@ -672,7 +740,8 @@ public class ConfigActivity extends Activity {
                     .putExtra("json", raw)
                     .putExtra("no_click_zoom", zoom)
                     .putExtra("panel_delay", delay)
-                    .putExtra("focus", focus));
+                    .putExtra("focus", focus)
+                    .putExtra("triple_gap", gap));
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 if (raw.equals(readCfg())) {
                     toast(what + "成功");
@@ -878,13 +947,21 @@ public class ConfigActivity extends Activity {
             } catch (Throwable ignored) {
                 // 没权限：下面的 toast 会提示
             }
+            // 三窗间隔同理（CanvasLayout 读它）
+            boolean gapOk = false;
+            try {
+                gapOk = Settings.Global.putString(
+                        getContentResolver(), TRIPLE_GAP_KEY, String.valueOf(tripleGap));
+            } catch (Throwable ignored) {
+            }
 
             if (writeGlobal(raw)) {
                 toast("已保存：" + hidden.length() + " 个隐藏，共 " + order.length() + " 个应用，"
-                        + "焦点=" + focusLabel() + "，延迟=" + panelDelay + "ms"
+                        + "焦点=" + focusLabel() + "，延迟=" + panelDelay + "ms，间隔=" + tripleGap + "dp"
                         + (focusOk ? "" : "（焦点项没写进去）")
                         + (zoomOk ? "" : "（点击放大开关没写进去）")
-                        + (delayOk ? "" : "（延迟项没写进去）"));
+                        + (delayOk ? "" : "（延迟项没写进去）")
+                        + (gapOk ? "" : "（间隔项没写进去）"));
                 finish();
                 return;
             }
@@ -896,7 +973,8 @@ public class ConfigActivity extends Activity {
                     .setPackage("android")
                     .putExtra("json", raw)
                     .putExtra("no_click_zoom", zoomValue)
-                    .putExtra("panel_delay", panelDelay));
+                    .putExtra("panel_delay", panelDelay)
+                    .putExtra("triple_gap", tripleGap));
             // 广播是异步的，等一小会儿回读，给用户真实结果，不要假装成功。
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 if (raw.equals(readCfg())) {

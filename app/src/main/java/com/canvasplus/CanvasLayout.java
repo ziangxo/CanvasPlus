@@ -42,6 +42,17 @@ final class CanvasLayout {
     private static volatile int skipped = 0;
 
     /**
+     * 三窗间隔配置（2026-11-22 用户要求可配置）。单位 dp；官方写死 10dp，本机
+     * density≈3.5 → 35px。默认 4dp，范围 0~20。key 与 ConfigActivity 一致。
+     * 2 秒 TTL 缓存：M1 在每次重排时被调用多次，不能每次都跨进程读 Settings.Global
+     * （noClickZoom 也是这个道理，但这里调用更频繁，所以加缓存）。
+     */
+    private static final String TRIPLE_GAP_KEY = "canvasplus_triple_gap";
+    private static final int TRIPLE_GAP_DEFAULT_DP = 4;
+    private static volatile int sTripleGapDp = TRIPLE_GAP_DEFAULT_DP;
+    private static volatile long sTripleGapReadAt = 0L;
+
+    /**
      * 两窗放大统一记账：记录哪些"画布实例"已经做过首次自动放大。
      *
      * 需求：进入系统画布二分屏时，默认让一个窗口占满（88%），另一个留一条（12%）。
@@ -246,6 +257,31 @@ final class CanvasLayout {
         } catch (Throwable ignored) {
             return true;
         }
+    }
+
+    /** 读三窗间隔（dp），带 2 秒 TTL 缓存；没配置过/坏值/越界一律退回默认 4dp。 */
+    private static int tripleGapDp() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - sTripleGapReadAt < 2000L) return sTripleGapDp;
+        sTripleGapReadAt = now;
+        try {
+            android.content.Context ctx = (android.content.Context)
+                    XposedHelpers.callStaticMethod(
+                            XposedHelpers.findClass("android.app.ActivityThread", null),
+                            "currentApplication");
+            if (ctx == null) return sTripleGapDp;
+            String raw = android.provider.Settings.Global.getString(
+                    ctx.getContentResolver(), TRIPLE_GAP_KEY);
+            if (raw == null || raw.isEmpty()) {
+                sTripleGapDp = TRIPLE_GAP_DEFAULT_DP;
+            } else {
+                int v = Integer.parseInt(raw.trim());
+                sTripleGapDp = (v >= 0 && v <= 20) ? v : TRIPLE_GAP_DEFAULT_DP;
+            }
+        } catch (Throwable ignored) {
+            sTripleGapDp = TRIPLE_GAP_DEFAULT_DP;
+        }
+        return sTripleGapDp;
     }
 
     /**
@@ -1089,8 +1125,17 @@ final class CanvasLayout {
                     try {
                         Object input = param.args[0];
                         if (!(input instanceof java.util.List)) return;
-                        if (((java.util.List<?>) input).size() != 4) return;
+                        int size = ((java.util.List<?>) input).size();
                         Object result = param.getResult();
+                        // 2026-11-22：三窗间隔可配置。官方 B1.l.e1/Y0 把间隔写死为
+                        // 10dp×density（本机≈35px），这里对返回的 3 个 Rect 原地压缩。
+                        // 只改 Rect、不碰 B1.l.w(全局 density)，避免影响圆角等其它换算；
+                        // 各窗口尺寸保持不变，只挪位置，union 变小后 A2 的 scale 自动放大补偿。
+                        if (size == 3 && result instanceof java.util.List) {
+                            applyTripleGap((java.util.List<?>) result);
+                            return;
+                        }
+                        if (size != 4) return;
                         if (result instanceof java.util.List
                                 && !((java.util.List<?>) result).isEmpty()) return;
                         Rect cell = phoneSize();
@@ -1203,6 +1248,106 @@ final class CanvasLayout {
             log("add limit lifted");
         } catch (Throwable error) {
             log("add limit hook failed: " + error);
+        }
+    }
+
+    /**
+     * 把官方 M1 算出的三窗间隔压缩到配置值（2026-11-22 用户要求可配置）。
+     *
+     * 【为什么要自己改 Rect】官方 B1.l.e1（放右侧）/Y0（放下方）里把窗口间隔写死
+     * 为 10dp×B1.l.w(density)，本机 density≈3.5 → 35px，三个窗口之间那圈黑边就是它。
+     * ColorOS 没给改这个间隔的接口，只能在 M1 返回后改 Rect。
+     *
+     * 【为什么不改 B1.l.w】那是全局 density 静态字段，圆角、图标、其它换算都用它，
+     * 改它会牵连一片。只改 M1 返回的 Rect 副本最干净。
+     *
+     * 【几何算法】三窗 = 1 大窗 + 2 小窗（模式 3/4/5/6）或 3 等分一线（模式 7）。
+     * 大窗：找面积最大那个；两小窗相对大窗必在同一侧（同在右/左/上/下）。
+     *   1) 大窗与两小窗之间的间隔：小窗整体沿该轴平移 delta，宽度/高度不变。
+     *   2) 两小窗彼此之间的间隔（垂直于 1 的轴）：靠后的那个再平移 delta。
+     * 所有窗口尺寸都不变，只是挪位置 → union 缩小，A2 的 scale 会自动把内容放大
+     * 补偿回来，窗口最终仍然填满屏幕，只是间隙变窄。
+     * 模式 7（一线三等分）退化为按 x 排序压缩两个间隙。
+     *
+     * 【delta 可正可负】目标 > 官方间隔时 delta 为负，窗口反向挪、间隔变大；
+     * 都不让间隔为负（不会重叠）。全程 try/catch，失败就用原 Rect，不影响三屏。
+     */
+    private static void applyTripleGap(java.util.List<?> result) {
+        try {
+            if (result.size() != 3) return;
+            java.util.List<Rect> rs = new java.util.ArrayList<>();
+            for (Object o : result) {
+                if (!(o instanceof Rect)) return;
+                rs.add(new Rect((Rect) o));
+            }
+            float density = android.content.res.Resources.getSystem()
+                    .getDisplayMetrics().density;
+            int target = Math.round(tripleGapDp() * density);
+            int off1, off2; // 两小窗在第 1 轴的平移量
+            int off2nd;     // 靠后小窗在第 2 轴的额外平移量
+
+            // 找面积最大的当大窗
+            int big = 0;
+            long best = -1;
+            for (int i = 0; i < 3; i++) {
+                long area = (long) rs.get(i).width() * rs.get(i).height();
+                if (area > best) { best = area; big = i; }
+            }
+            int s1 = -1, s2 = -1;
+            for (int i = 0; i < 3; i++) if (i != big) { if (s1 < 0) s1 = i; else s2 = i; }
+            Rect main = rs.get(big), a = rs.get(s1), b = rs.get(s2);
+
+            // 判断两小窗在大窗的哪一侧：看小窗中心相对大窗中心
+            float mc = (main.left + main.right) / 2f;
+            float ac = (a.left + a.right) / 2f;
+            boolean subRight = ac > mc;
+            float mvc = (main.top + main.bottom) / 2f;
+            float avc = (a.top + a.bottom) / 2f;
+            boolean subDown = avc > mvc;
+
+            // 第 1 轴：大窗 ↔ 小窗的间隔（水平优先，除非小窗明显在上下）
+            boolean horizFirst = Math.abs(ac - mc) >= Math.abs(avc - mvc);
+            if (horizFirst) {
+                int curGap = subRight
+                        ? Math.min(a.left, b.left) - main.right
+                        : main.left - Math.max(a.right, b.right);
+                int d = curGap - target;
+                off1 = subRight ? -d : d;
+                // 第 2 轴：两小窗彼此（上下）
+                int gap2 = (a.bottom <= b.top) ? b.top - a.bottom
+                        : ((b.bottom <= a.top) ? a.top - b.bottom : 0);
+                off2nd = (a.bottom <= b.top) ? -(gap2 - target) : (gap2 - target);
+                for (Rect r : new Rect[]{a, b}) { r.left += off1; r.right += off1; }
+                if (a.bottom <= b.top) { b.top += off2nd; b.bottom += off2nd; }
+                else if (b.bottom <= a.top) { a.top += off2nd; a.bottom += off2nd; }
+            } else {
+                int curGap = subDown
+                        ? Math.min(a.top, b.top) - main.bottom
+                        : main.top - Math.max(a.bottom, b.bottom);
+                int d = curGap - target;
+                off1 = subDown ? -d : d;
+                int gap2 = (a.right <= b.left) ? b.left - a.right
+                        : ((b.right <= a.left) ? a.left - b.right : 0);
+                off2nd = (a.right <= b.left) ? -(gap2 - target) : (gap2 - target);
+                for (Rect r : new Rect[]{a, b}) { r.top += off1; r.bottom += off1; }
+                if (a.right <= b.left) { b.left += off2nd; b.right += off2nd; }
+                else if (b.right <= a.left) { a.left += off2nd; a.right += off2nd; }
+            }
+
+            boolean changed = (off1 != 0 || off2nd != 0);
+            if (changed) {
+                // 写回 result（保持同一份 List 引用，调用方拿到的还是这批 Rect）
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> out = (java.util.List<Object>) result;
+                out.set(big, new Rect(main));
+                out.set(s1, new Rect(a));
+                out.set(s2, new Rect(b));
+            }
+            log("triple gap dp=" + tripleGapDp() + " targetPx=" + target
+                    + " off1=" + off1 + " off2=" + off2nd
+                    + " rects=" + result);
+        } catch (Throwable error) {
+            log("triple gap failed (keep native): " + error);
         }
     }
 
